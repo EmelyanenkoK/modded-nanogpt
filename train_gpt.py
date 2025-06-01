@@ -264,11 +264,21 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(head_dim, max_seq_len)
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        if CANON and CANON_B:
+            self.canon_b_conv_full = nn.Conv1d(3 * dim, 3 * dim, kernel_size=4, padding=3, groups=3 * dim, bias=False, dtype=torch.bfloat16)
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        qkv = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x))
+        if CANON and CANON_B:
+            canon_b_in = qkv.permute(0, 2, 1)
+            canon_b_out = self.canon_b_conv_full(canon_b_in)  # Shape: [B, 3 * D, T + padding]
+            canon_b_out = canon_b_out.permute(0, 2, 1)        # BDT -> BTD, Shape: [B, T + padding, 3 * D]
+            canon_b_out = canon_b_out[:, :T, :].contiguous()             # Trim to original sequence length: [B, T, 3 * D]
+            qkv = (qkv + canon_b_out).contiguous()
+
+        q, k, v = qkv.view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         if ve is not None:
@@ -289,9 +299,17 @@ class MLP(nn.Module):
         self.c_fc = CastedLinear(dim, hdim)
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        if CANON and CANON_D:
+            self.canon_d_conv_full = nn.Conv1d(4*dim, 4*dim, kernel_size=4, padding=3, groups=4*dim, bias=False, dtype=torch.bfloat16)
 
     def forward(self, x: Tensor):
         x = self.c_fc(x)
+        if CANON and CANON_D:
+            canon_d_in = x.permute(0, 2, 1)
+            canon_d_out = self.canon_d_conv_full(canon_d_in)  # Shape: [B, 4 * D, T + padding]
+            canon_d_out = canon_d_out.permute(0, 2, 1)        # BDT -> BTD, Shape: [B, T + padding, 4 * D]
+            canon_d_out = canon_d_out[:, :x.size(1), :]       # Trim to original sequence length: [B, T, 4 * D]
+            x = (x + canon_d_out).contiguous()
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
         return x
@@ -303,11 +321,30 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
         self.mlp = MLP(dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+        if CANON:
+            if CANON_A:
+                self.canon_a_conv_full = nn.Conv1d(dim, dim, kernel_size=4, padding=3, groups=dim, bias=False, dtype=torch.bfloat16)
+            if CANON_C:
+                self.canon_c_conv_full = nn.Conv1d(dim, dim, kernel_size=4, padding=3, groups=dim, bias=False, dtype=torch.bfloat16)
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
+        if CANON and CANON_A:
+            canon_a_in = x.permute(0, 2, 1) # BTD -> BDT
+            canon_a_out = self.canon_a_conv_full(canon_a_in)  # Shape: [B, D, T+padding]
+            canon_a_out = canon_a_out.permute(0, 2, 1)        # BDT -> BTD, Shape: [B, T+padding, D]
+            canon_a_out = canon_a_out[:, :x.size(1), :]       # Trim to original sequence length: [B, T, D]
+            x = (x + canon_a_out).contiguous()
+            
         if self.attn is not None:
             x = x + self.attn(norm(x), ve, block_mask)
+
+        if CANON and CANON_C:
+            canon_c_in = x.permute(0, 2, 1)
+            canon_c_out = self.canon_c_conv_full(canon_c_in)
+            canon_c_out = canon_c_out.permute(0, 2, 1)        # BDT -> BTD
+            canon_c_out = canon_c_out[:, :x.size(1), :]       # Trim after permute
+            x = (x + canon_c_out).contiguous()
         x = x + self.mlp(norm(x))
         return x
 
@@ -438,6 +475,17 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
 # -----------------------------------------------------------------------------
 # int main
 
+import argparse
+parser = argparse.ArgumentParser(description="Train GPT model")
+
+# CANON flags
+parser.add_argument("--canon_a", action="store_true", help="Enable CANON A")
+parser.add_argument("--canon_b", action="store_true", help="Enable CANON B")
+parser.add_argument("--canon_c", action="store_true", help="Enable CANON C")
+parser.add_argument("--canon_d", action="store_true", help="Enable CANON D")
+
+cmd_args = parser.parse_args()
+
 @dataclass
 class Hyperparameters:
     # data
@@ -454,7 +502,21 @@ class Hyperparameters:
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
+    # CANON flags
+    canon_a: bool = cmd_args.canon_a
+    canon_b: bool = cmd_args.canon_b
+    canon_c: bool = cmd_args.canon_c
+    canon_d: bool = cmd_args.canon_d
+
 args = Hyperparameters()
+CANON = args.canon_a or args.canon_b or args.canon_c or args.canon_d
+if CANON:
+    CANON_A = args.canon_a
+    CANON_B = args.canon_b
+    CANON_C = args.canon_c
+    CANON_D = args.canon_d
+
+print(f"CANON A: {CANON_A}, CANON B: {CANON_B}, CANON C: {CANON_C}, CANON D: {CANON_D}")
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
@@ -689,7 +751,21 @@ for step in range(train_steps + 1):
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-
+        if CANON: # lets output to CANON_stats.dat as well
+            #for each combiation of CANON_X, output the stats in separate files
+            canon_stats_filename = "CANON"
+            if CANON_A:
+                canon_stats_filename += "_A"
+            if CANON_B:
+                canon_stats_filename += "_B"
+            if CANON_C:
+                canon_stats_filename += "_C"
+            if CANON_D:
+                canon_stats_filename += "_D"
+            canon_stats_filename += "_stats.dat"
+            with open(canon_stats_filename, "a") as f:
+                f.write(f"{step} {val_loss:.4f} {training_time_ms:.0f}\n")
+                
     if last_step:
         if master_process and args.save_checkpoint:
             log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
