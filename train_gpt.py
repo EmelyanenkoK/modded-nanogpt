@@ -681,13 +681,21 @@ def _gradient_hook(param: Tensor):
     if param.grad is None:
         return
 
+    # Ensure gradient is float32 for consistent reduction
+    if param.grad.dtype == torch.bfloat16:
+        param.grad = param.grad.float() # Convert bfloat16 grads to float32
+
     bucket_idx = param_to_bucket[param]
     bucket_ready_count[bucket_idx] += 1
 
     # Check if all parameters in this bucket are ready
     if bucket_ready_count[bucket_idx] == len(param_buckets[bucket_idx]):
         # All-reduce this bucket
-        bucket_grads = [p.grad for p in param_buckets[bucket_idx]]
+        # Now, all p.grad in param_buckets[bucket_idx] should be float32
+        bucket_grads = [p.grad for p in param_buckets[bucket_idx] if p.grad is not None] # Ensure grad exists
+
+        if not bucket_grads: # Handle case where all grads in bucket might be None
+            return
 
         # For multi-tensor operations, we can reduce them together
         if len(bucket_grads) == 1:
@@ -765,7 +773,7 @@ for step in range(train_steps + 1):
             canon_stats_filename += "_stats.dat"
             with open(canon_stats_filename, "a") as f:
                 f.write(f"{step} {val_loss:.4f} {training_time_ms:.0f}\n")
-                
+
     if last_step:
         if master_process and args.save_checkpoint:
             log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
