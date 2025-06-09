@@ -333,6 +333,7 @@ class GPT(nn.Module):
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
         self.skip_weights = nn.Parameter(torch.ones(num_layers//2))
+        self.stacked_last_block_num = 1
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
@@ -390,6 +391,7 @@ class GPT(nn.Module):
 
         # U-net design by @brendanh0gan
         skip_connections = []
+        last_connection = None
         n = len(self.skip_weights)
         for i in range(len(self.blocks)):
             if i >= n:
@@ -397,12 +399,38 @@ class GPT(nn.Module):
             x = self.blocks[i](x, ve[i], x0, block_masks[i])
             if i < n:
                 skip_connections.append(x)
+            if i == n - 1:
+                last_connection = x
+        
+        y, z  = None, x # for inference we will stack as many copies of the last block as needed
+        # for testing we stack only one copy of the last block, and independently compute the loss
+        # prior and after the last block, so we have 2 terms in the loss
+        # we will store base output in x, after first copy of the last block in y, and after all copies in z
+        if self.stacked_last_block_num > 0:
+            for ind in range(self.stacked_last_block_num):
+                z = z + self.skip_weights[-1] * last_connection
+                z = self.blocks[-1](z, ve[-1], x0, block_masks[-1])
+                if ind == 0:
+                    y = z
+        
+        if not self.training:
+            x = z # for inference we only return the final output after all blocks
 
         x = norm(x)
         logits = self.lm_head(x).float()
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction='sum' if self.training else 'mean')
+        if self.training:
+            # lets calc second term related to y
+            if y is not None:
+                y = norm(y)
+                logits_y = self.lm_head(y).float()
+                logits_y = 30 * torch.sigmoid(logits_y / (7.5 * y.size(-1)**0.5))
+                loss_y = F.cross_entropy(logits_y.view(-1, logits_y.size(-1)), target_seq, reduction='sum')
+                loss_aux = torch.relu(loss_y - loss.detach()) # encourage model to learn that loss_y <= loss, but not encourage to degrade loss
+                loss = loss + loss_aux * 0.3
+
         return loss
 
 # -----------------------------------------------------------------------------
@@ -668,6 +696,9 @@ for step in range(train_steps + 1):
 
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+      for stacked_last_block_num in [0, 1, 2, 3, 5, 10, 20]:
+        model.stacked_last_block_num = stacked_last_block_num
+        code = f"stacked_last_block_num={stacked_last_block_num}"
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
@@ -689,6 +720,7 @@ for step in range(train_steps + 1):
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
+      model.stacked_last_block_num = 1 # reset to default for training
 
     if last_step:
         if master_process and args.save_checkpoint:
