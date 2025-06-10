@@ -20,6 +20,12 @@ import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 
+WIDE_BLOCK_PROJ = True # if false - use 4 static permutations, else linear projections
+WIDE_BLOCK_SKIP_CONNECTIONS = True # if true, add to output of attention 4 concatenated inputs like x|x|x|x
+WIDE_BLOCK_VARIABLE_HEADS = True # if true, use 4 different groups of heads: 8 heads, 6 heads, 4 heads, 2 heads
+
+WIDE_BLOCK_MASK = [True] + [False] * 11 # which blocks should be wide blocks?
+
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
@@ -311,6 +317,54 @@ class Block(nn.Module):
         x = x + self.mlp(norm(x))
         return x
 
+g = torch.Generator(device="cuda")
+g.manual_seed(17) 
+class WideBlock(nn.Module):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
+        super().__init__()
+        hdim = 4 * dim
+        if WIDE_BLOCK_PROJ:
+            self.proj = CastedLinear(dim, hdim, use_fp8=True, x_s=(dim**0.5)/448, w_s=24/448, grad_s=1/448)
+        else:
+            self.perms = [torch.randperm(dim, generator=g) for _ in range(4)]
+        if WIDE_BLOCK_VARIABLE_HEADS:
+            self.attns = []
+            for num_heads in [8, 6, 4, 2]:
+                self.attns.append(CausalSelfAttention(dim, num_heads, max_seq_len, head_dim=dim//num_heads))
+        else:
+          self.attns = [CausalSelfAttention(dim, num_heads, max_seq_len, head_dim=dim//num_heads) for _ in range(4)]
+        
+        self.c_proj = CastedLinear(hdim, dim)
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+
+    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
+        #if self.attn is not None:
+        #    x = x + self.attn(norm(x), ve, block_mask)
+        #x = x + self.mlp(norm(x))
+        hidden = None
+        if WIDE_BLOCK_PROJ:
+            hidden = self.proj(norm(x))
+            # lets separate hidden to 4 parts, each for one attention head
+            hidden = hidden.view(*hidden.shape[:-1], 4, -1).unbind(dim=-2)
+        else:
+            hidden = [norm(x[..., perm]) for perm in self.perms]        
+        # apply attention heads
+        attn_outs = []
+        for i, attn in enumerate(self.attns):
+            attn_outs.append(attn(hidden[i], ve, block_mask))
+        for i in range(len(attn_outs)):
+            if WIDE_BLOCK_SKIP_CONNECTIONS:
+                attn_outs[i] = norm(x + attn_outs[i]) # add skip connection to each attention head output
+            else:
+                attn_outs[i] = norm(attn_outs[i])
+        
+        # now let combine the outputs of attention heads and make back projection
+        hidden = torch.cat(attn_outs, dim=-1)
+        hidden = F.relu(hidden).square()
+        x = x + self.c_proj(hidden)
+        return x
+
 # -----------------------------------------------------------------------------
 # The main model
 
@@ -324,7 +378,13 @@ class GPT(nn.Module):
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
+        #self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
+        self.blocks = []
+        for (index,is_wide) in enumerate(WIDE_BLOCK_MASK):
+            if is_wide:
+                self.blocks.append(WideBlock(model_dim, num_heads, max_seq_len, index))
+            else:
+                self.blocks.append(Block(model_dim, num_heads, max_seq_len, index))
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128),
