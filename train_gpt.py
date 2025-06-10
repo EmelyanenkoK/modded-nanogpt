@@ -388,6 +388,8 @@ class GPT(nn.Module):
 
         x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
 
+        # we want to store output of N-2 and N-1 blocks to later use it in auxiliary loss
+        x_prev_prev, x_prev = None, None
         # U-net design by @brendanh0gan
         skip_connections = []
         n = len(self.skip_weights)
@@ -395,6 +397,10 @@ class GPT(nn.Module):
             if i >= n:
                 x = x + self.skip_weights[i - n] * skip_connections.pop()
             x = self.blocks[i](x, ve[i], x0, block_masks[i])
+            if i == len(self.blocks) - 2:
+                x_prev_prev = x
+            elif i == len(self.blocks) - 1:
+                x_prev = x
             if i < n:
                 skip_connections.append(x)
 
@@ -403,6 +409,19 @@ class GPT(nn.Module):
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction='sum' if self.training else 'mean')
+        if self.training:
+            x_prev_prev, x_prev = norm(x_prev_prev), norm(x_prev)
+            logits_prev_prev = self.lm_head(x_prev_prev).float()
+            logits_prev = self.lm_head(x_prev).float()
+
+            logits_prev_prev = 30 * torch.sigmoid(logits_prev_prev / (7.5 * x_prev_prev.size(-1)**0.5))
+            logits_prev = 30 * torch.sigmoid(logits_prev / (7.5 * x_prev.size(-1)**0.5))
+
+            aux_loss_prev_prev = F.cross_entropy(logits_prev_prev.view(-1, logits_prev_prev.size(-1)), target_seq, reduction='sum')
+            aux_loss_prev = F.cross_entropy(logits_prev.view(-1, logits_prev.size(-1)), target_seq, reduction='sum')
+            prev_prev_coeff = 0.2
+            prev_coeff = 0.3
+            loss = (prev_prev_coeff * aux_loss_prev_prev + prev_coeff * aux_loss_prev + loss)/ ( 1 + prev_coeff + prev_prev_coeff)
         return loss
 
 # -----------------------------------------------------------------------------
