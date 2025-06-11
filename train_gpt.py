@@ -250,6 +250,8 @@ class Rotary(nn.Module):
     def forward(self, x_BTHD: Tensor):
         assert self.cos.size(0) >= x_BTHD.size(-3)
         cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
+        cos = cos.to(device=x_BTHD.device)
+        sin = sin.to(device=x_BTHD.device)
         x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
@@ -317,53 +319,127 @@ class Block(nn.Module):
         x = x + self.mlp(norm(x))
         return x
 
-g = torch.Generator(device="cuda")
+g = torch.Generator()
 g.manual_seed(17) 
+
+class WideBlockInputMixer(nn.Module):
+    def __init__(self, dim: int, use_proj: bool, generator: torch.Generator):
+        super().__init__()
+        self.dim = dim
+        self.num_streams = 4  # Based on the original logic
+        self.use_proj = use_proj
+
+        if self.use_proj:
+            # Original proj was CastedLinear(dim, 4 * dim)
+            self.proj = CastedLinear(dim, self.num_streams * dim, use_fp8=True, x_s=(dim**0.5)/448, w_s=24/448, grad_s=1/448)
+        else:
+            # Store permutations; they will be moved to device in forward
+            self.perms_list = [torch.randperm(dim, generator=generator) for _ in range(self.num_streams)]
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x shape: (B, T, D)
+        # Output shape: (B, T, num_streams, D)
+        x = norm(x)  # Apply norm first
+        if self.use_proj:
+            # Apply norm before projection
+            projected = self.proj(x)  # (B, T, num_streams * D)
+            return projected.view(*projected.shape[:-1], self.num_streams, self.dim)
+        else:
+            # Apply norm after permutation for each stream
+            streams = []
+            for i in range(self.num_streams):
+                perm = self.perms_list[i].to(x.device)
+                streams.append(x[..., perm])
+            return torch.stack(streams, dim=2)
+
+class ParallelAttentionStreams(nn.Module):
+    def __init__(self, dim: int, num_heads_per_stream_config: list[int], max_seq_len: int, use_skip_connections: bool):
+        super().__init__()
+        self.num_streams = len(num_heads_per_stream_config)
+        self.use_skip_connections = use_skip_connections
+
+        self.attns = nn.ModuleList()
+        for num_h in num_heads_per_stream_config:
+            # head_dim is calculated inside CausalSelfAttention based on dim and num_h
+            self.attns.append(CausalSelfAttention(dim, num_h, max_seq_len, head_dim=dim//num_h))
+
+    def forward(self, stream_inputs: Tensor, x_residual_source: Tensor, ve: Tensor | None, block_mask: BlockMask) -> Tensor:
+        # stream_inputs shape: (B, T, num_streams, D)
+        # x_residual_source shape: (B, T, D) - for skip connections
+        # Output shape: (B, T, num_streams, D)
+        
+        outputs = []
+        for i in range(self.num_streams):
+            current_stream_input = stream_inputs[:, :, i, :]  # (B, T, D)
+            attn_output = self.attns[i](current_stream_input, ve, block_mask) # (B, T, D)
+            
+            if self.use_skip_connections:
+                # norm is applied after adding the residual (x_residual_source)
+                processed_attn_output = norm(x_residual_source + attn_output)
+            else:
+                processed_attn_output = norm(attn_output)
+            outputs.append(processed_attn_output)
+            
+        return torch.stack(outputs, dim=2)
+
+class WideBlockOutputCombiner(nn.Module):
+    def __init__(self, dim: int, num_streams: int = 4):
+        super().__init__()
+        self.dim = dim
+        self.num_streams = num_streams
+        # Original c_proj was CastedLinear(4 * dim, dim)
+        self.c_proj = CastedLinear(self.num_streams * dim, dim)
+
+    def forward(self, combined_attn_outputs: Tensor) -> Tensor:
+        # combined_attn_outputs shape: (B, T, num_streams, D)
+        # Output shape: (B, T, D)
+        B, T, _, _ = combined_attn_outputs.shape
+        
+        # Reshape to (B, T, num_streams * D)
+        reshaped_outputs = combined_attn_outputs.contiguous().view(B, T, self.num_streams * self.dim)
+        
+        activated_outputs = F.relu(reshaped_outputs).square()
+        projected_output = self.c_proj(activated_outputs)
+        return projected_output
+
 class WideBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
         super().__init__()
-        hdim = 4 * dim
-        if WIDE_BLOCK_PROJ:
-            self.proj = CastedLinear(dim, hdim, use_fp8=True, x_s=(dim**0.5)/448, w_s=24/448, grad_s=1/448)
-        else:
-            self.perms = [torch.randperm(dim, generator=g) for _ in range(4)]
-        if WIDE_BLOCK_VARIABLE_HEADS:
-            self.attns = []
-            for num_heads in [8, 6, 4, 2]:
-                self.attns.append(CausalSelfAttention(dim, num_heads, max_seq_len, head_dim=dim//num_heads))
-        else:
-          self.attns = [CausalSelfAttention(dim, num_heads, max_seq_len, head_dim=dim//num_heads) for _ in range(4)]
-        
-        self.c_proj = CastedLinear(hdim, dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+        
+        num_streams = 4
+        
+        if WIDE_BLOCK_VARIABLE_HEADS:
+            num_heads_for_streams_config = [12, 8, 6, 4]
+            assert len(num_heads_for_streams_config) == num_streams, "Mismatch in num_streams for variable heads"
+        else:
+            num_heads_for_streams_config = [num_heads] * num_streams
+
+        # Pass the global generator `g` to WideBlockInputMixer for reproducibility of permutations
+        self.input_mixer = WideBlockInputMixer(dim, use_proj=WIDE_BLOCK_PROJ, generator=g)
+        self.parallel_attns = ParallelAttentionStreams(dim, num_heads_for_streams_config, max_seq_len, 
+                                                       use_skip_connections=WIDE_BLOCK_SKIP_CONNECTIONS)
+        self.output_combiner = WideBlockOutputCombiner(dim, num_streams=num_streams)
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
-        x = self.lambdas[0] * x + self.lambdas[1] * x0
-        #if self.attn is not None:
-        #    x = x + self.attn(norm(x), ve, block_mask)
-        #x = x + self.mlp(norm(x))
-        hidden = None
-        if WIDE_BLOCK_PROJ:
-            hidden = self.proj(norm(x))
-            # lets separate hidden to 4 parts, each for one attention head
-            hidden = hidden.view(*hidden.shape[:-1], 4, -1).unbind(dim=-2)
-        else:
-            hidden = [norm(x[..., perm]) for perm in self.perms]        
-        # apply attention heads
-        attn_outs = []
-        for i, attn in enumerate(self.attns):
-            attn_outs.append(attn(hidden[i], ve, block_mask))
-        for i in range(len(attn_outs)):
-            if WIDE_BLOCK_SKIP_CONNECTIONS:
-                attn_outs[i] = norm(x + attn_outs[i]) # add skip connection to each attention head output
-            else:
-                attn_outs[i] = norm(attn_outs[i])
+        # 1. Initial residual connection (from original x and x0)
+        x_after_initial_residual = self.lambdas[0] * x + self.lambdas[1] * x0
         
-        # now let combine the outputs of attention heads and make back projection
-        hidden = torch.cat(attn_outs, dim=-1)
-        hidden = F.relu(hidden).square()
-        x = x + self.c_proj(hidden)
-        return x
+        # 2. Prepare inputs for parallel attention streams
+        # The input_mixer handles the norm call internally before projection/permutation.
+        mixed_inputs = self.input_mixer(x_after_initial_residual) # Shape: (B, T, num_streams, D)
+        
+        # 3. Apply parallel attention heads
+        # x_after_initial_residual is used as the source for skip connections inside parallel_attns
+        parallel_attn_stream_outputs = self.parallel_attns(mixed_inputs, x_after_initial_residual, ve, block_mask) # Shape: (B, T, num_streams, D)
+        
+        # 4. Combine outputs and apply final projection
+        combined_projection_output = self.output_combiner(parallel_attn_stream_outputs) # Shape: (B, T, D)
+        
+        # 5. Final residual connection (with the state after initial residual)
+        x_final = x_after_initial_residual + combined_projection_output
+        
+        return x_final
 
 # -----------------------------------------------------------------------------
 # The main model
@@ -385,6 +461,7 @@ class GPT(nn.Module):
                 self.blocks.append(WideBlock(model_dim, num_heads, max_seq_len, index))
             else:
                 self.blocks.append(Block(model_dim, num_heads, max_seq_len, index))
+        self.blocks = nn.ModuleList(self.blocks)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128),
