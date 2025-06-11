@@ -250,16 +250,16 @@ class Rotary(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128, kv=None):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         hdim = num_heads * head_dim
         std = 0.5 * (dim ** -0.5)
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
-        # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
-        # https://x.com/hi_tysam/status/1879699187107033311
-        self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
+        self.q_w = nn.Parameter(torch.empty(hdim, dim).uniform_(-bound, bound))
+        # all heads share the same key and value weights
+        self.kv_w = nn.Parameter(torch.empty(2 * head_dim, dim).uniform_(-bound, bound)) if kv is None else kv
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(head_dim, max_seq_len)
         self.c_proj = CastedLinear(hdim, dim)
@@ -268,13 +268,17 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        q, k = norm(q), norm(k) # QK norm @Grad62304977
-        q, k = self.rotary(q), self.rotary(k)
+        #q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q = F.linear(x, self.q_w.type_as(x)).view(B, T, self.num_heads, self.head_dim)
+        k_shared, v_shared = F.linear(x, self.kv_w.type_as(x)).view(B, T, 2, self.head_dim).unbind(dim=2)
+        q, k_shared_norm = norm(q), norm(k_shared) # Apply norm to q and shared k
+        k_expanded = k_shared_norm.unsqueeze(2).expand(B, T, self.num_heads, self.head_dim)
+        v_expanded = v_shared.unsqueeze(2).expand(B, T, self.num_heads, self.head_dim)
+        q, k = self.rotary(q), self.rotary(k_expanded)
         if ve is not None:
-            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
+            v = self.lambdas[0] * v_expanded + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
-            v = self.lambdas[0] * v
+            v = self.lambdas[0] * v_expanded
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=0.12).transpose(1, 2)
@@ -297,10 +301,10 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int, kv: Tensor | None = None):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
+        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len, kv) if layer_idx != 7 else None
         self.mlp = MLP(dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
@@ -325,6 +329,12 @@ class GPT(nn.Module):
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
+        # self.kv = nn.Parameter(torch.empty(2 * model_dim, model_dim).uniform_(-0.5 * (model_dim ** -0.5), 0.5 * (model_dim ** -0.5)))
+        # self.blocks = nn.ModuleList(
+        #                [Block(model_dim, num_heads, max_seq_len, i) for i in range(3)] +
+        #                [Block(model_dim, num_heads, max_seq_len, i, kv=kv) for i in range(3, num_layers-3)] +
+        #                [Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers-3, num_layers)])
+
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128),
