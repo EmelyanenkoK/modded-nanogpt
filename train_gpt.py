@@ -19,7 +19,7 @@ import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
-
+QK_TIE = False
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
@@ -249,6 +249,16 @@ class Rotary(nn.Module):
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
+class LoRA(nn.Module):
+    def __init__(self, in_features: int, out_features: int, rank: int):
+        super().__init__()
+        self.rank = rank
+        self.lora_a = nn.Parameter(torch.empty(in_features, rank).uniform_(-0.01, 0.01))
+        self.lora_b = nn.Parameter(torch.empty(rank, out_features).uniform_(-0.01, 0.01))
+
+    def forward(self, x: Tensor):
+        return F.linear(x, self.lora_a @ self.lora_b)
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128):
         super().__init__()
@@ -282,26 +292,79 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
+class CausalSelfAttentionQKTied(nn.Module):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128, shared_q:Tensor | None = None):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        hdim = num_heads * head_dim
+        std = 0.5 * (dim ** -0.5)
+        bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
+        # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
+        # https://x.com/hi_tysam/status/1879699187107033311
+        if shared_q:
+            self.shared_q = shared_q
+            self.shared2myQ = LoRA(hdim, hdim, rank=128)
+            self.v_w = nn.Parameter(torch.empty(hdim, dim).uniform_(-bound, bound)) 
+        self.qv_w = nn.Parameter(torch.empty(2, hdim, dim).uniform_(-bound, bound))
+        self.q2k = LoRA(hdim, hdim, rank=128)
+        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+        self.rotary = Rotary(head_dim, max_seq_len)
+        self.c_proj = CastedLinear(hdim, dim)
+        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+
+    def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
+        B, T = x.size(0), x.size(1) # batch size, sequence length
+        assert B == 1, "Must use batch size = 1 for FlexAttention"
+        if self.shared_q:
+            q = self.shared2myQ(self.shared_q)
+            q = F.linear(x, q.flatten(end_dim=1).type_as(x)).view(B, T, self.num_heads, self.head_dim)
+            v = F.linear(x, self.v_w.flatten(end_dim=1).type_as(x)).view(B, T, self.num_heads, self.head_dim)
+        else:
+            q, v = F.linear(x, self.qv_w.flatten(end_dim=1).type_as(x)).view(B, T, 2 * self.num_heads, self.head_dim).chunk(2, dim=-2)
+        k = self.q2k(q)
+        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q, k = self.rotary(q), self.rotary(k)
+        if ve is not None:
+            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
+        else: # skip mid-layers token value embeddings by @YouJiacheng
+            v = self.lambdas[0] * v
+        # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
+        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=0.12).transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        return y
+
 class MLP(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, shared_proj: Tensor | None = None):
         super().__init__()
         hdim = 4 * dim
         self.c_fc = CastedLinear(dim, hdim)
-        self.c_proj = CastedLinear(hdim, dim)
-        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        if shared_proj is not None:
+            self.shared_proj = shared_proj
+            self.shared2myProj = LoRA(hdim, hdim, rank=128)
+        else:
+            self.c_proj = CastedLinear(hdim, dim)
+            self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x: Tensor):
         x = self.c_fc(x)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x)
+        if self.shared_proj:
+            x = self.shared2myProj(self.shared_proj(x))
+        else:
+            x = self.c_proj(x)
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int,
+                       shared_q: Tensor | None = None, shared_proj: Tensor | None = None):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
-        self.mlp = MLP(dim)
+        attn = CausalSelfAttentionQKTied if QK_TIE else CausalSelfAttention
+        self.attn = attn(dim, num_heads, max_seq_len, shared_q=shared_q) if layer_idx != 7 else None
+        self.mlp = MLP(dim, shared_proj=shared_proj)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
@@ -508,11 +571,15 @@ for param in model.parameters():
 # collect the parameters to optimize
 hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
 embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-scalar_params = [p for p in model.parameters() if p.ndim < 2]
+scalar_params = [p for n, p in model.named_parameters() if p.ndim < 2 and ("skip_weights" in n or "attn.lambdas" in n)]
+block_lambdas = [p for n, p in model.blocks.named_parameters() if "lambdas" in n and "attn.lambdas" not in n]
 head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
-adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
+adam_params = [dict(params=head_params, lr=0.22),
+               dict(params=embed_params, lr=0.6),
+               dict(params=scalar_params, lr=0.04),
+               dict(params=block_lambdas, lr=0.04)] #TODO, I guess we can have much higher learning rate for block lambdas
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
