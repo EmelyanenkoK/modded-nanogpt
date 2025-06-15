@@ -19,7 +19,7 @@ import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
-QK_TIE = False
+QK_TIE = True
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
@@ -253,14 +253,15 @@ class LoRA(nn.Module):
     def __init__(self, in_features: int, out_features: int, rank: int):
         super().__init__()
         self.rank = rank
-        self.lora_a = nn.Parameter(torch.empty(in_features, rank).uniform_(-0.01, 0.01))
-        self.lora_b = nn.Parameter(torch.empty(rank, out_features).uniform_(-0.01, 0.01))
+        self.lora_a = nn.Parameter(torch.empty(in_features, rank, dtype=torch.bfloat16).uniform_(-0.01, 0.01))
+        self.lora_b = nn.Parameter(torch.empty(rank, out_features, dtype=torch.bfloat16).uniform_(-0.01, 0.01))
 
     def forward(self, x: Tensor):
-        return F.linear(x, self.lora_a @ self.lora_b)
+        x_m = F.linear(x, self.lora_b.type_as(x))
+        return F.linear(x_m, self.lora_a.type_as(x))
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128, shared_q:Tensor | None = None):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -302,11 +303,12 @@ class CausalSelfAttentionQKTied(nn.Module):
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
         # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
+        self.shared_q = shared_q
         if shared_q:
-            self.shared_q = shared_q
             self.shared2myQ = LoRA(hdim, hdim, rank=128)
-            self.v_w = nn.Parameter(torch.empty(hdim, dim).uniform_(-bound, bound)) 
-        self.qv_w = nn.Parameter(torch.empty(2, hdim, dim).uniform_(-bound, bound))
+            self.v_w = nn.Parameter(torch.empty(hdim, dim).uniform_(-bound, bound))
+        else: 
+            self.qv_w = nn.Parameter(torch.empty(2, hdim, dim).uniform_(-bound, bound))
         self.q2k = LoRA(hdim, hdim, rank=128)
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(head_dim, max_seq_len)
@@ -316,13 +318,16 @@ class CausalSelfAttentionQKTied(nn.Module):
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        if self.shared_q:
+        if self.shared_q is not None:
             q = self.shared2myQ(self.shared_q)
-            q = F.linear(x, q.flatten(end_dim=1).type_as(x)).view(B, T, self.num_heads, self.head_dim)
-            v = F.linear(x, self.v_w.flatten(end_dim=1).type_as(x)).view(B, T, self.num_heads, self.head_dim)
+            q = F.linear(x, q.type_as(x)).view(B, T, self.num_heads, self.head_dim)
+            v = F.linear(x, self.v_w.type_as(x)).view(B, T, self.num_heads, self.head_dim)
         else:
             q, v = F.linear(x, self.qv_w.flatten(end_dim=1).type_as(x)).view(B, T, 2 * self.num_heads, self.head_dim).chunk(2, dim=-2)
+        q = q.view(B, T, self.num_heads * self.head_dim)
         k = self.q2k(q)
+        q = q.view(B, T, self.num_heads, self.head_dim)
+        k = k.view(B, T, self.num_heads, self.head_dim)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         if ve is not None:
@@ -341,8 +346,8 @@ class MLP(nn.Module):
         super().__init__()
         hdim = 4 * dim
         self.c_fc = CastedLinear(dim, hdim)
+        self.shared_proj = shared_proj
         if shared_proj is not None:
-            self.shared_proj = shared_proj
             self.shared2myProj = LoRA(hdim, hdim, rank=128)
         else:
             self.c_proj = CastedLinear(hdim, dim)
@@ -351,7 +356,7 @@ class MLP(nn.Module):
     def forward(self, x: Tensor):
         x = self.c_fc(x)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        if self.shared_proj:
+        if self.shared_proj is not None:
             x = self.shared2myProj(self.shared_proj(x))
         else:
             x = self.c_proj(x)
@@ -387,6 +392,9 @@ class GPT(nn.Module):
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
+        #std = 0.5 * (model_dim ** -0.5)
+        #bound = (3 ** 0.5) * std
+        #self.shared_q = nn.Parameter(torch.empty(model_dim, model_dim).uniform_(-bound, bound))
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
