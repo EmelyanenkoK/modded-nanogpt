@@ -20,6 +20,7 @@ import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 QK_TIE = True
+SHARED_Q = False
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
@@ -253,8 +254,10 @@ class LoRA(nn.Module):
     def __init__(self, in_features: int, out_features: int, rank: int):
         super().__init__()
         self.rank = rank
-        self.lora_a = nn.Parameter(torch.empty(in_features, rank, dtype=torch.bfloat16).uniform_(-0.01, 0.01))
-        self.lora_b = nn.Parameter(torch.empty(rank, out_features, dtype=torch.bfloat16).uniform_(-0.01, 0.01))
+        # TODO we can not make here dtype=torch.bfloat16, because there will be parameter buckets
+        # with different dtypes, probably should be revisited
+        self.lora_a = nn.Parameter(torch.empty(in_features, rank).uniform_(-0.01, 0.01))
+        self.lora_b = nn.Parameter(torch.empty(rank, out_features).uniform_(-0.01, 0.01))
 
     def forward(self, x: Tensor):
         x_m = F.linear(x, self.lora_b.type_as(x))
@@ -304,7 +307,7 @@ class CausalSelfAttentionQKTied(nn.Module):
         # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
         self.shared_q = shared_q
-        if shared_q:
+        if shared_q is not None:
             self.shared2myQ = LoRA(hdim, hdim, rank=128)
             self.v_w = nn.Parameter(torch.empty(hdim, dim).uniform_(-bound, bound))
         else: 
@@ -392,10 +395,10 @@ class GPT(nn.Module):
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        #std = 0.5 * (model_dim ** -0.5)
-        #bound = (3 ** 0.5) * std
-        #self.shared_q = nn.Parameter(torch.empty(model_dim, model_dim).uniform_(-bound, bound))
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
+        std = 0.5 * (model_dim ** -0.5)
+        bound = (3 ** 0.5) * std
+        self.shared_q = nn.Parameter(torch.empty(model_dim, model_dim).uniform_(-bound, bound)) if SHARED_Q else None
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i, shared_q = self.shared_q) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128),
@@ -518,7 +521,7 @@ class Hyperparameters:
     train_seq_len = 48*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 1770 # number of iterations to run
+    num_iterations = 2000 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # architecture
     vocab_size = 50257
@@ -577,17 +580,28 @@ for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
 # collect the parameters to optimize
-hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
+hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and 
+                         ("embed" not in n) and 
+                         ("lora" not in n.lower()) and
+                         ("shared_q" not in n)
+                         ]
 embed_params = [p for n, p in model.named_parameters() if "embed" in n]
 scalar_params = [p for n, p in model.named_parameters() if p.ndim < 2 and ("skip_weights" in n or "attn.lambdas" in n)]
 block_lambdas = [p for n, p in model.blocks.named_parameters() if "lambdas" in n and "attn.lambdas" not in n]
 head_params = [model.lm_head.weight]
+# there are a lot of relatively low-dimenstion LoRA parameters in the model
+# we don't want to optimize it with Muon, because it seems overhead is too high
+lora_params = [p for n, p in model.named_parameters() if "lora" in n.lower()]
+shared_q_param_group = [model.shared_q] if hasattr(model, "shared_q") else []
 
 # init the optimizer(s)
 adam_params = [dict(params=head_params, lr=0.22),
                dict(params=embed_params, lr=0.6),
                dict(params=scalar_params, lr=0.04),
-               dict(params=block_lambdas, lr=0.04)] #TODO, I guess we can have much higher learning rate for block lambdas
+               dict(params=block_lambdas, lr=0.04), #TODO, I guess we can have much higher learning rate for block lambdas
+               dict(params=shared_q_param_group, lr=0.04),
+               dict(params=lora_params, lr=0.04),
+               ] 
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
@@ -742,7 +756,7 @@ for step in range(train_steps + 1):
     last_step = (step == train_steps)
 
     # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0) or (step == 1770):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
@@ -775,11 +789,15 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
+    t_1 = time.perf_counter()
+    res = model(inputs, targets, get_window_size_blocks(step))
+    t_2 = time.perf_counter()
+    res.backward()
+    t_3 = time.perf_counter()
     #for param in model.parameters():
     #    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-    wait_for_gradients() # does the same thing as commented two lines above, but faster
-
+    wait_for_gradients() # does the same thing as commented two lines above, but faster    
+    t_4 = time.perf_counter()
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
@@ -790,6 +808,9 @@ for step in range(train_steps + 1):
     # step the optimizers
     for opt in optimizers:
         opt.step()
+    t_5 = time.perf_counter()
+    if master_process and (step % 20 == 0):
+      print(f"Forward step: {1000*(t_2-t_1):.0f}; Backward: {1000*(t_3-t_2):.0f}; Sync: {1000*(t_4-t_3):.0f}; Optimization: {1000*(t_5-t_4):.0f}")
     # null the gradients
     model.zero_grad(set_to_none=True)
     # logging
