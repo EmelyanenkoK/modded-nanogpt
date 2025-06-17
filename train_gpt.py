@@ -544,6 +544,10 @@ print0("="*100)
 
 model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=12, num_heads=6, model_dim=768,
                        max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+# lets print total number of params
+total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Total number of trainable parameters: {total_params:,} ({total_params / 1e6:.2f}M)")
+
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
@@ -747,11 +751,15 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
+    t_1 = time.perf_counter()
+    res = model(inputs, targets, get_window_size_blocks(step))
+    t_2 = time.perf_counter()
+    res.backward()
+    t_3 = time.perf_counter()
     #for param in model.parameters():
     #    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-    wait_for_gradients() # does the same thing as commented two lines above, but faster
-
+    wait_for_gradients() # does the same thing as commented two lines above, but faster    
+    t_4 = time.perf_counter()
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
@@ -762,6 +770,12 @@ for step in range(train_steps + 1):
     # step the optimizers
     for opt in optimizers:
         opt.step()
+    t_5 = time.perf_counter()
+    if master_process and (step % 20 == 0):
+      timelog=f"Forward step: {1000*(t_2-t_1):.0f}; Backward: {1000*(t_3-t_2):.0f}; Sync: {1000*(t_4-t_3):.0f}; Optimization: {1000*(t_5-t_4):.0f}"
+      print(timelog)
+      if step % 500:
+          print0(timelog)
     # null the gradients
     model.zero_grad(set_to_none=True)
     # logging
