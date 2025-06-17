@@ -19,7 +19,9 @@ import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
-
+ADDITIONAL_VALUE_EMBEDDINGS = True
+LORA_VALUE_EMBEDDINGS = False
+LORA_LM_HEAD = False
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
@@ -249,6 +251,34 @@ class Rotary(nn.Module):
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
+class LoRA(nn.Module):
+    def __init__(self, in_features: int, out_features: int, rank: int):
+        super().__init__()
+        self.rank = rank
+        # TODO we can not make here dtype=torch.bfloat16, because there will be parameter buckets
+        # with different dtypes, probably should be revisited
+        self.lora_a = nn.Parameter(torch.empty(in_features, rank).uniform_(-0.01, 0.01))
+        self.lora_b = nn.Parameter(torch.empty(rank, out_features).uniform_(-0.01, 0.01))
+
+    def forward(self, x: Tensor):
+        x_m = F.linear(x, self.lora_b.type_as(x))
+        return x + F.linear(x_m, self.lora_a.type_as(x))
+
+class LoRALinearHead(nn.Module):
+    def __init__(self, embed: nn.Embedding, rank: int):
+        super().__init__()
+        D = embed.embedding_dim
+        V = embed.num_embeddings
+        self.lora_a = nn.Parameter(torch.empty(D, rank).uniform_(-0.01, 0.01))
+        self.lora_b = nn.Parameter(torch.empty(rank, V).uniform_(-0.01, 0.01))
+        self.embed   = embed
+
+    def forward(self, x: Tensor):
+        base = F.linear(x, self.embed.weight.T)
+        delta = F.linear(F.linear(x, self.lora_b.type_as(x)),
+                         self.lora_a.type_as(x))
+        return base + delta
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128):
         super().__init__()
@@ -323,11 +353,18 @@ class GPT(nn.Module):
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
-        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
+        if ADDITIONAL_VALUE_EMBEDDINGS:
+            if LORA_VALUE_EMBEDDINGS:
+                self.ve_lora = nn.ModuleList([LoRA(model_dim, model_dim, rank=128) for _ in range(3)])
+            else:
+                self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128),
+        if LORA_LM_HEAD:
+            self.lm_head = LoRALinearHead(self.embed, rank=128)
+        else:
+          self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128),
                                     use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
         self.lm_head.weight.detach().zero_() # @Grad62304977
         # Add learnable skip connection weights for decoder layers
@@ -377,16 +414,24 @@ class GPT(nn.Module):
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
 
-        ve = [value_embed(input_seq) for value_embed in self.value_embeds]
-        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
+        x = self.embed(input_seq)
+        if ADDITIONAL_VALUE_EMBEDDINGS:
+            if LORA_VALUE_EMBEDDINGS:
+                ve = [lora(x) for lora in self.ve_lora]
+            else:
+                ve = [value_embed(input_seq) for value_embed in self.value_embeds]
+            # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
+            ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
+        else:
+            ve = [None] * len(self.blocks)
+
         assert len(ve) == len(self.blocks)
 
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
         assert len(block_masks) == len(self.blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        x = x0 = norm(x[None]) # use of norm here by @Grad62304977
 
         # U-net design by @brendanh0gan
         skip_connections = []
@@ -509,10 +554,12 @@ for param in model.parameters():
 hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
 embed_params = [p for n, p in model.named_parameters() if "embed" in n]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
-head_params = [model.lm_head.weight]
+#head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
-adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
+adam_params = [dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
+if not LORA_LM_HEAD:
+    adam_params.append(dict(params=model.lm_head.weight, lr=0.22))
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
