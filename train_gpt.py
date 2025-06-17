@@ -20,8 +20,11 @@ import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 ADDITIONAL_VALUE_EMBEDDINGS = True
-LORA_VALUE_EMBEDDINGS = False
+LORA_VALUE_EMBEDDINGS = True
 LORA_LM_HEAD = False
+SHARED_MLP_PROJ = False
+LORA_VE_RANK, LORA_LM_HEAD_RANK, LORA_MLP_RANK = 128, 128, 128
+SYNC_ON_MEASUREMENTS = False
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
@@ -269,12 +272,12 @@ class LoRALinearHead(nn.Module):
         super().__init__()
         D = embed.embedding_dim
         V = embed.num_embeddings
-        self.lora_a = nn.Parameter(torch.empty(D, rank).uniform_(-0.01, 0.01))
-        self.lora_b = nn.Parameter(torch.empty(rank, V).uniform_(-0.01, 0.01))
+        self.lora_a = nn.Parameter(torch.empty(V, rank).uniform_(-0.01, 0.01))
+        self.lora_b = nn.Parameter(torch.empty(rank, D).uniform_(-0.01, 0.01))
         self.embed   = embed
 
     def forward(self, x: Tensor):
-        base = F.linear(x, self.embed.weight.T)
+        base = F.linear(x, self.embed.weight)
         delta = F.linear(F.linear(x, self.lora_b.type_as(x)),
                          self.lora_a.type_as(x))
         return base + delta
@@ -313,25 +316,32 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class MLP(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, proj_base: Tensor | None = None):
         super().__init__()
         hdim = 4 * dim
         self.c_fc = CastedLinear(dim, hdim)
-        self.c_proj = CastedLinear(hdim, dim)
-        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        self.c_proj = proj_base
+        if proj_base is not None:
+            # initialize Lora that will modify shared base
+            self.lora = LoRA(dim, dim, rank=LORA_MLP_RANK)
+        else:
+            self.c_proj = CastedLinear(hdim, dim)
+            self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x: Tensor):
         x = self.c_fc(x)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
+        if hasattr(self, 'lora'):
+            x = self.lora(x)
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int, mlp_proj: Tensor | None = None):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
-        self.mlp = MLP(dim)
+        self.mlp = MLP(dim, proj_base=mlp_proj)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
@@ -355,18 +365,23 @@ class GPT(nn.Module):
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         if ADDITIONAL_VALUE_EMBEDDINGS:
             if LORA_VALUE_EMBEDDINGS:
-                self.ve_lora = nn.ModuleList([LoRA(model_dim, model_dim, rank=128) for _ in range(3)])
+                self.ve_lora = nn.ModuleList([LoRA(model_dim, model_dim, rank=LORA_VE_RANK) for _ in range(3)])
             else:
                 self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
+        shared_mlp_proj = None
+        if SHARED_MLP_PROJ:
+            shared_mlp_proj = CastedLinear(4 * model_dim, model_dim, use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
+            shared_mlp_proj.weight.detach().zero_() # @Grad62304977
+            self.shared_mlp_proj = shared_mlp_proj
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i, mlp_proj = shared_mlp_proj) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         if LORA_LM_HEAD:
-            self.lm_head = LoRALinearHead(self.embed, rank=128)
+            self.lm_head = LoRALinearHead(self.embed, rank=LORA_LM_HEAD_RANK)
         else:
           self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128),
                                     use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
-        self.lm_head.weight.detach().zero_() # @Grad62304977
+          self.lm_head.weight.detach().zero_() # @Grad62304977
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
         self.skip_weights = nn.Parameter(torch.ones(num_layers//2))
@@ -546,7 +561,8 @@ model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=12, num_heads=6, m
                        max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
 # lets print total number of params
 total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f"Total number of trainable parameters: {total_params:,} ({total_params / 1e6:.2f}M)")
+if master_process:
+  print(f"Total number of trainable parameters: {total_params:,} ({total_params / 1e6:.2f}M)")
 
 for m in model.modules():
     if isinstance(m, nn.Embedding):
@@ -555,15 +571,28 @@ for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
 # collect the parameters to optimize
-hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
-embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and ("embed" not in n) and ("lora" not in n) ]
+embed_params = [p for n, p in model.named_parameters() if "embed" in n and "ve_lora" not in n]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 #head_params = [model.lm_head.weight]
 
+lora_params = []
+if ADDITIONAL_VALUE_EMBEDDINGS and LORA_VALUE_EMBEDDINGS:
+    for module in model.ve_lora:
+        lora_params.extend(list(module.parameters()))
+if SHARED_MLP_PROJ: # lets add lora parameters from MLP blocks to lora_params
+    for block in model.blocks:
+        if hasattr(block, 'mlp') and hasattr(block.mlp, 'lora'):
+            lora_params.extend(list(block.mlp.lora.parameters()))
+    # also in that case base model will have paramer .shared_mlp_proj, we want to add it to hidden_matrix_params
+    if hasattr(model, 'shared_mlp_proj'):
+        hidden_matrix_params.append(model.shared_mlp_proj.weight)
 # init the optimizer(s)
 adam_params = [dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
 if not LORA_LM_HEAD:
     adam_params.append(dict(params=model.lm_head.weight, lr=0.22))
+if len(lora_params):
+    adam_params.append(dict(params=lora_params, lr=0.04))
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
@@ -751,14 +780,22 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
+    if SYNC_ON_MEASUREMENTS:
+        torch.cuda.synchronize()
     t_1 = time.perf_counter()
     res = model(inputs, targets, get_window_size_blocks(step))
+    if SYNC_ON_MEASUREMENTS:
+        torch.cuda.synchronize()
     t_2 = time.perf_counter()
     res.backward()
+    if SYNC_ON_MEASUREMENTS:
+        torch.cuda.synchronize()
     t_3 = time.perf_counter()
     #for param in model.parameters():
     #    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-    wait_for_gradients() # does the same thing as commented two lines above, but faster    
+    wait_for_gradients() # does the same thing as commented two lines above, but faster
+    if SYNC_ON_MEASUREMENTS:
+        torch.cuda.synchronize()    
     t_4 = time.perf_counter()
     # set optimization hyperparameters
     for opt in optimizers:
@@ -770,6 +807,8 @@ for step in range(train_steps + 1):
     # step the optimizers
     for opt in optimizers:
         opt.step()
+    if SYNC_ON_MEASUREMENTS:
+        torch.cuda.synchronize()
     t_5 = time.perf_counter()
     if master_process and (step % 20 == 0):
       timelog=f"Forward step: {1000*(t_2-t_1):.0f}; Backward: {1000*(t_3-t_2):.0f}; Sync: {1000*(t_4-t_3):.0f}; Optimization: {1000*(t_5-t_4):.0f}"
