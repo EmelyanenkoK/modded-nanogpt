@@ -19,7 +19,7 @@ import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
-
+PLD_RANGE = [4,5,6,7,8] # layers that can be randomly dropped during training, to improve robustness
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
@@ -186,7 +186,9 @@ class Muon(torch.optim.Optimizer):
                 if base_i + self.rank < len(params):
                     p = params[base_i + self.rank]
                     g = p.grad
-                    assert g is not None
+                    if g is None:
+                        continue
+                    #assert g is not None
                     state = self.state[p]
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(g)
@@ -333,6 +335,7 @@ class GPT(nn.Module):
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
         self.skip_weights = nn.Parameter(torch.ones(num_layers//2))
+        self.blocks_to_skip = set() # blocks to skip during training
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
@@ -394,9 +397,13 @@ class GPT(nn.Module):
         for i in range(len(self.blocks)):
             if i >= n:
                 x = x + self.skip_weights[i - n] * skip_connections.pop()
-            x = self.blocks[i](x, ve[i], x0, block_masks[i])
+            if not (i in self.blocks_to_skip):
+                x = self.blocks[i](x, ve[i], x0, block_masks[i])
             if i < n:
-                skip_connections.append(x)
+                    # at least add previous layer's output to skip connections
+                    # it is better than add zero. Anyway usually most of the signal
+                    # is passed through the residual connection
+                    skip_connections.append(x)
 
         x = norm(x)
         logits = self.lm_head(x).float()
@@ -544,6 +551,17 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(1728 * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
+def get_pld_chance(step: int):
+    """Chance of using PLD (Partial Layer Decoupling) at this step"""
+    x = step / args.num_iterations # progress in training
+    assert 0 <= x <= 1
+    # for first 20% steps it is strictly zero
+    # then linearly increase to 200% chance at the end
+    if x < 0.2:
+        return 0.0
+    else:
+        return 2 * (x - 0.2) / 0.8
+
 model: nn.Module = torch.compile(model, dynamic=False)
 
 ########################################
@@ -671,20 +689,35 @@ for step in range(train_steps + 1):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
+        model.module.blocks_to_skip = set() # reset blocks to skip for validation
         model.eval()
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
         val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
         val_loss = 0
+        inptargs = []
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets = next(val_loader)
+                inptargs.append((inputs, targets))
                 val_loss += model(inputs, targets, get_window_size_blocks(step))
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        if last_step:
+            #lets also validate with one block off (check all blocks)
+            for i in range(len(model.module.blocks)):
+                model.module.blocks_to_skip = {i}
+                val_loss = 0
+                for inputs, targets in inptargs:
+                    # we use the same inputs and targets as in the main validation loop
+                    # to avoid reloading the data, which is expensive
+                    val_loss += model(inputs, targets, get_window_size_blocks(step))
+                val_loss /= val_steps
+                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+                print0(f"step:{step}/{train_steps} val_loss_block_{i}:{val_loss:.4f}", console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -700,6 +733,33 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
+
+    # --- PLD Synchronization Logic ---
+    # Decide which blocks to skip on the master process
+    blocks_to_skip_tensor = torch.zeros(len(model.module.blocks), dtype=torch.bool, device='cuda')
+    pld_chance_val = get_pld_chance(step)
+    if model.module.training and pld_chance_val > 0:
+        available_pld_range = PLD_RANGE.copy()
+        if rank == 0: # Only rank 0 makes the random choices
+            while pld_chance_val > 0 and available_pld_range:
+                if pld_chance_val >= 1:
+                    idx_to_pop = torch.randint(len(available_pld_range), (1,)).item()
+                    block_to_skip = available_pld_range.pop(idx_to_pop)
+                    blocks_to_skip_tensor[block_to_skip] = True
+                    pld_chance_val -= 1
+                else:
+                    if torch.rand(1).item() < pld_chance_val:
+                        idx_to_pop = torch.randint(len(available_pld_range), (1,)).item()
+                        block_to_skip = available_pld_range.pop(idx_to_pop)
+                        blocks_to_skip_tensor[block_to_skip] = True
+                    pld_chance_val = 0
+    
+    # Broadcast the decision from rank 0 to all other ranks
+    dist.broadcast(blocks_to_skip_tensor, src=0)
+    
+    # Set the synchronized decision on the model for the forward pass
+    model.module.blocks_to_skip = {i for i, skip in enumerate(blocks_to_skip_tensor) if skip}
+
     model(inputs, targets, get_window_size_blocks(step)).backward()
     #for param in model.parameters():
     #    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
