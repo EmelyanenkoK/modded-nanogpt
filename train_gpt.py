@@ -171,10 +171,13 @@ class Muon(torch.optim.Optimizer):
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
+            params_with_grad = [p for p in group["params"] if p.grad is not None]
+            if not params_with_grad:
+                continue
             update_buffer: Tensor = group["update_buffer"]
             update_buffer_views: list[Tensor] = group["update_buffer_views"]
             # generate weight updates in distributed fashion
-            params: list[Tensor] = group["params"]
+            params: list[Tensor] = params_with_grad
             handle = None
             params_world = None
             def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
@@ -186,26 +189,21 @@ class Muon(torch.optim.Optimizer):
                 if base_i + self.rank < len(params):
                     p = params[base_i + self.rank]
                     g = p.grad
-                    if g is None:
-                        # If grad is None, it means this parameter was not used (e.g., skipped by PLD).
-                        # The update should be zero. We create a zero tensor to pass to the all_gather
-                        # operation to maintain synchronization across all ranks.
-                        g = torch.zeros_like(p.data).flatten()
-                    else:
-                        state = self.state[p]
-                        if "momentum_buffer" not in state:
-                            state["momentum_buffer"] = torch.zeros_like(g)
-                        buf: Tensor = state["momentum_buffer"]
-                        buf.lerp_(g, 1 - group["momentum"])
-                        g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
-                        g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf: Tensor = state["momentum_buffer"]
+                    buf.lerp_(g, 1 - group["momentum"])
+                    g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
                 else:
                     g = update_buffer_views[self.rank]
                 if base_i > 0:
                     update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
                 handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
                 params_world = params[base_i : base_i + self.world_size]
-            update_prev()
+            if handle is not None:
+                update_prev()
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -338,7 +336,6 @@ class GPT(nn.Module):
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
         self.skip_weights = nn.Parameter(torch.ones(num_layers//2))
-        self.blocks_to_skip = set() # blocks to skip during training
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
@@ -380,7 +377,7 @@ class GPT(nn.Module):
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor, skip_mask: torch.BoolTensor):
         assert input_seq.ndim == 1
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
@@ -400,8 +397,14 @@ class GPT(nn.Module):
         for i in range(len(self.blocks)):
             if i >= n:
                 x = x + self.skip_weights[i - n] * skip_connections.pop()
-            if not (i in self.blocks_to_skip):
-                x = self.blocks[i](x, ve[i], x0, block_masks[i])
+            def run_block(t):
+                return self.blocks[i](t, ve[i], x0, block_masks[i])
+            # ‼ only the branch that matches skip_mask[i] will run
+            x = torch.cond(
+                skip_mask[i],               # predicate  (BoolTensor[()])
+                lambda: x,                  # true branch  – keep x unchanged
+                lambda: run_block(x)        # false branch – execute block i
+            )
             if i < n:
                     # at least add previous layer's output to skip connections
                     # it is better than add zero. Anyway usually most of the signal
@@ -692,7 +695,7 @@ for step in range(train_steps + 1):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
-        model.blocks_to_skip = set() # reset blocks to skip for validation
+        blocks_to_skip_tensor = torch.zeros(len(model.blocks), dtype=torch.bool, device='cuda')
         model.eval()
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
@@ -704,7 +707,7 @@ for step in range(train_steps + 1):
             for _ in range(val_steps):
                 inputs, targets = next(val_loader)
                 inptargs.append((inputs, targets))
-                val_loss += model(inputs, targets, get_window_size_blocks(step))
+                val_loss += model(inputs, targets, get_window_size_blocks(step), blocks_to_skip_tensor)
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -713,12 +716,13 @@ for step in range(train_steps + 1):
             with torch.no_grad():
                 #lets also validate with one block off (check all blocks)
                 for i in range(len(model.blocks)):
-                    model.blocks_to_skip = {i}
+                    blocks_to_skip_tensor = torch.zeros(len(model.blocks), dtype=torch.bool, device='cuda')
+                    blocks_to_skip_tensor[i] = True # skip this block
                     val_loss = 0
                     for inputs, targets in inptargs:
                         # we use the same inputs and targets as in the main validation loop
                         # to avoid reloading the data, which is expensive
-                        val_loss += model(inputs, targets, get_window_size_blocks(step))
+                        val_loss += model(inputs, targets, get_window_size_blocks(step), blocks_to_skip_tensor)
                     val_loss /= val_steps
                     dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
                     print0(f"step:{step}/{train_steps} val_loss_block_{i}:{val_loss:.4f}", console=True)
@@ -760,11 +764,8 @@ for step in range(train_steps + 1):
     
     # Broadcast the decision from rank 0 to all other ranks
     dist.broadcast(blocks_to_skip_tensor, src=0)
-    
-    # Set the synchronized decision on the model for the forward pass
-    model.blocks_to_skip = {i for i, skip in enumerate(blocks_to_skip_tensor) if skip}
 
-    model(inputs, targets, get_window_size_blocks(step)).backward()
+    model(inputs, targets, get_window_size_blocks(step), blocks_to_skip_tensor).backward()
     #for param in model.parameters():
     #    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
     wait_for_gradients() # does the same thing as commented two lines above, but faster
