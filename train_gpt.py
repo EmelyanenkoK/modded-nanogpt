@@ -397,14 +397,16 @@ class GPT(nn.Module):
         for i in range(len(self.blocks)):
             if i >= n:
                 x = x + self.skip_weights[i - n] * skip_connections.pop()
-            def run_block(t):
-                return self.blocks[i](t, ve[i], x0, block_masks[i])
-            # ‼ only the branch that matches skip_mask[i] will run
-            x = torch.cond(
-                skip_mask[i],               # predicate  (BoolTensor[()])
-                lambda: x,                  # true branch  – keep x unchanged
-                lambda: run_block(x)        # false branch – execute block i
-            )
+            mask = skip_mask[i].to(x.dtype).view([1] * x.ndim)
+            # unfortnuately, any approach that would allow us to not compute
+            # layer when we want to skip, heavily breaks compilation
+            # 'if' in python causes recompilation on each step, so do torch.where
+            # torch.cond should work, but complain about `cond_true might be aliasing the input or the output!`
+            # instead we calc all layers but then use mask to skip it
+            # idea is that while we won't speed up forward pass,
+            # we will speed up backward pass, as we won't have to calc gradients
+            out = self.blocks[i](x, ve[i], x0, block_masks[i])
+            x = mask * x + (1.0 - mask) * out
             if i < n:
                     # at least add previous layer's output to skip connections
                     # it is better than add zero. Anyway usually most of the signal
@@ -578,9 +580,10 @@ model: nn.Module = torch.compile(model, dynamic=False)
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
+blocks_to_skip_tensor = torch.zeros(len(model.blocks), dtype=torch.bool, device='cuda')
 for _ in range(warmup_steps):
     inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
-    model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
+    model(inputs.to(torch.int32), targets, get_window_size_blocks(0), blocks_to_skip_tensor).backward()
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
