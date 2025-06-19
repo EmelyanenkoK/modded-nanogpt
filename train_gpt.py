@@ -19,7 +19,7 @@ import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
-PLD_RANGE = [4,5,6,7,8] # layers that can be randomly dropped during training, to improve robustness
+PLD_RANGE = [3,4,5,6,7,8,9,10] # layers that can be randomly dropped during training, to improve robustness
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
@@ -187,15 +187,18 @@ class Muon(torch.optim.Optimizer):
                     p = params[base_i + self.rank]
                     g = p.grad
                     if g is None:
-                        continue
-                    #assert g is not None
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf: Tensor = state["momentum_buffer"]
-                    buf.lerp_(g, 1 - group["momentum"])
-                    g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
-                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
+                        # If grad is None, it means this parameter was not used (e.g., skipped by PLD).
+                        # The update should be zero. We create a zero tensor to pass to the all_gather
+                        # operation to maintain synchronization across all ranks.
+                        g = torch.zeros_like(p.data).flatten()
+                    else:
+                        state = self.state[p]
+                        if "momentum_buffer" not in state:
+                            state["momentum_buffer"] = torch.zeros_like(g)
+                        buf: Tensor = state["momentum_buffer"]
+                        buf.lerp_(g, 1 - group["momentum"])
+                        g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+                        g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
                 else:
                     g = update_buffer_views[self.rank]
                 if base_i > 0:
@@ -689,7 +692,7 @@ for step in range(train_steps + 1):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
-        model.module.blocks_to_skip = set() # reset blocks to skip for validation
+        model.blocks_to_skip = set() # reset blocks to skip for validation
         model.eval()
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
@@ -707,17 +710,18 @@ for step in range(train_steps + 1):
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         if last_step:
-            #lets also validate with one block off (check all blocks)
-            for i in range(len(model.module.blocks)):
-                model.module.blocks_to_skip = {i}
-                val_loss = 0
-                for inputs, targets in inptargs:
-                    # we use the same inputs and targets as in the main validation loop
-                    # to avoid reloading the data, which is expensive
-                    val_loss += model(inputs, targets, get_window_size_blocks(step))
-                val_loss /= val_steps
-                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-                print0(f"step:{step}/{train_steps} val_loss_block_{i}:{val_loss:.4f}", console=True)
+            with torch.no_grad():
+                #lets also validate with one block off (check all blocks)
+                for i in range(len(model.blocks)):
+                    model.blocks_to_skip = {i}
+                    val_loss = 0
+                    for inputs, targets in inptargs:
+                        # we use the same inputs and targets as in the main validation loop
+                        # to avoid reloading the data, which is expensive
+                        val_loss += model(inputs, targets, get_window_size_blocks(step))
+                    val_loss /= val_steps
+                    dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+                    print0(f"step:{step}/{train_steps} val_loss_block_{i}:{val_loss:.4f}", console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -736,9 +740,9 @@ for step in range(train_steps + 1):
 
     # --- PLD Synchronization Logic ---
     # Decide which blocks to skip on the master process
-    blocks_to_skip_tensor = torch.zeros(len(model.module.blocks), dtype=torch.bool, device='cuda')
+    blocks_to_skip_tensor = torch.zeros(len(model.blocks), dtype=torch.bool, device='cuda')
     pld_chance_val = get_pld_chance(step)
-    if model.module.training and pld_chance_val > 0:
+    if model.training and pld_chance_val > 0:
         available_pld_range = PLD_RANGE.copy()
         if rank == 0: # Only rank 0 makes the random choices
             while pld_chance_val > 0 and available_pld_range:
@@ -758,7 +762,7 @@ for step in range(train_steps + 1):
     dist.broadcast(blocks_to_skip_tensor, src=0)
     
     # Set the synchronized decision on the model for the forward pass
-    model.module.blocks_to_skip = {i for i, skip in enumerate(blocks_to_skip_tensor) if skip}
+    model.blocks_to_skip = {i for i, skip in enumerate(blocks_to_skip_tensor) if skip}
 
     model(inputs, targets, get_window_size_blocks(step)).backward()
     #for param in model.parameters():
