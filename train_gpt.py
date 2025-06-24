@@ -283,9 +283,10 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class MLP(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, mlp_multiplier: int):
         super().__init__()
-        hdim = 4 * dim
+        self.mlp_multiplier = mlp_multiplier
+        hdim = mlp_multiplier * dim
         self.c_fc = CastedLinear(dim, hdim)
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
@@ -297,11 +298,11 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int, mlp_multiplier: int):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
-        self.mlp = MLP(dim)
+        self.mlp = MLP(dim, mlp_multiplier)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
@@ -318,13 +319,13 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, mlp_multiplier: int = 4):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i, mlp_multiplier=mlp_multiplier) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128),
@@ -405,6 +406,34 @@ class GPT(nn.Module):
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction='sum' if self.training else 'mean')
         return loss
 
+
+def bind_gpts(smaller: GPT, larger: GPT):
+    # we basically get 2 GPT with identical architecture, but different MLP sizes
+    # everything except MLP should be binded (so the same parameters are shared between)
+    # no asserts here, we believe we know what we are doing
+    larger.embed = smaller.embed
+    larger.value_embeds = smaller.value_embeds
+    larger.lm_head = smaller.lm_head
+    # in blocks we bind the attention and lambdas, but not the MLP
+    for i in range(len(smaller.blocks)):
+        larger.blocks[i].attn = smaller.blocks[i].attn
+        larger.blocks[i].lambdas = smaller.blocks[i].lambdas
+        # we do not bind the MLP, so the MLPs are different
+
+def upscale_gpts(smaller: GPT, larger: GPT):
+    # in smaller GPT we have MLP with mlp_multiplier smaller than in larger GPT
+    # so basically there are more weights in larger MLP than in smaller MLP
+    # now we need to copy all MLP weights from smaller to larger (leave all untouched weigths in larger MLP uninitialized)
+
+    # all blocks has the same shape, and gpt share dim
+    hdim_small = smaller.blocks[0].mlp.c_fc.weight.shape[0]
+    for i in range(len(smaller.blocks)):
+        larger.blocks[i].mlp.c_fc.weight.data[:hdim_small, :] = smaller.blocks[i].mlp.c_fc.weight.data
+        larger.blocks[i].mlp.c_proj.weight.data[:, :hdim_small] = smaller.blocks[i].mlp.c_proj.weight.data
+
+
+
+
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
 
@@ -454,6 +483,7 @@ class Hyperparameters:
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
+    switch_step = 1375 # at which step to switch from small to large model
 args = Hyperparameters()
 
 # torchrun sets these env variables
@@ -497,30 +527,45 @@ print0("="*100)
 #    Construct model and optimizer     #
 ########################################
 
-model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=12, num_heads=6, model_dim=768,
-                       max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
-for m in model.modules():
+large_model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=12, num_heads=6, model_dim=768,
+                       max_seq_len=max(args.train_seq_len, args.val_seq_len))
+small_model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=12, num_heads=6, model_dim=768,
+                            max_seq_len=max(args.train_seq_len, args.val_seq_len), mlp_multiplier=2)
+large_model = large_model.cuda()
+small_model = small_model.cuda()
+bind_gpts(small_model, large_model) # bind the two models together
+for m in large_model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
-for param in model.parameters():
+
+for param in large_model.parameters():
     dist.broadcast(param.detach(), 0)
+# separately broadcast MLP weights of smaller model across ranks
+for name, param in small_model.named_parameters():
+    if "mlp" in name:
+        dist.broadcast(param.detach(), 0)
 
 # collect the parameters to optimize
-hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
-embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-scalar_params = [p for p in model.parameters() if p.ndim < 2]
-head_params = [model.lm_head.weight]
+hidden_matrix_params = [p for n, p in large_model.blocks.named_parameters() if p.ndim >= 2 and ("embed" not in n) and ("mlp" not in n)]
+mlp_params = [p for n, p in large_model.blocks.named_parameters() if p.ndim >= 2 and "mlp" in n]
+small_mlp_params = [p for n, p in small_model.blocks.named_parameters() if p.ndim >= 2 and "mlp" in n]
+embed_params = [p for n, p in large_model.named_parameters() if "embed" in n]
+scalar_params = [p for p in large_model.parameters() if p.ndim < 2]
+head_params = [large_model.lm_head.weight]
 
 # init the optimizer(s)
 adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
-optimizers = [optimizer1, optimizer2]
-for opt in optimizers:
+optimizer2 = Muon(hidden_matrix_params + mlp_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
+optimizer2_small = Muon(hidden_matrix_params + small_mlp_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
+all_optimizers = [optimizer1, optimizer2, optimizer2_small]
+for opt in all_optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
+
+large_optimizers, small_optimizers = [optimizer1, optimizer2], [optimizer1, optimizer2_small]
 
 # learning rate schedule: stable then decay
 def get_lr(step: int):
@@ -544,78 +589,41 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(1728 * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
-model: nn.Module = torch.compile(model, dynamic=False)
+large_model: nn.Module = torch.compile(large_model, dynamic=False)
+small_model: nn.Module = torch.compile(small_model, dynamic=False)
 
 ########################################
 #            Warmup kernels            #
 ########################################
-
-# Warmup the training kernels, then re-initialize the state so we aren't cheating
-warmup_steps = 10
-initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                     optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-for _ in range(warmup_steps):
-    inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
-    model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
-    for opt in optimizers:
-        opt.step()
-    model.zero_grad(set_to_none=True)
-model.load_state_dict(initial_state["model"])
-for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
-    opt.load_state_dict(opt_state)
-del initial_state
+for w_model, w_optimizers in [(large_model, large_optimizers), (small_model, small_optimizers)]:
+    # Warmup the training kernels, then re-initialize the state so we aren't cheating
+    warmup_steps = 10
+    initial_state = dict(model=copy.deepcopy(w_model.state_dict()),
+                        optimizers=[copy.deepcopy(opt.state_dict()) for opt in w_optimizers]) # save the initial state
+    for _ in range(warmup_steps):
+        inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
+        w_model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
+        for opt in w_optimizers:
+            opt.step()
+        w_model.zero_grad(set_to_none=True)
+    w_model.load_state_dict(initial_state["model"])
+    for opt, opt_state in zip(w_optimizers, initial_state["optimizers"]):
+        opt.load_state_dict(opt_state)
+    del initial_state
 
 ########################################
 #      Overlap Communication Setup     #
 ########################################
 
-# Create parameter buckets for better overlap
-def create_buckets(params, bucket_size_mb=25):
-    """Group parameters into buckets of approximately bucket_size_mb MB each"""
-    buckets = []
-    current_bucket = []
-    current_size = 0
-
-    # Sort parameters by size (largest first) for better bucketing
-    sorted_params = sorted(params, key=lambda p: p.numel(), reverse=True)
-
-    for param in sorted_params:
-        param_size_mb = param.numel() * param.element_size() / (1024 * 1024)
-
-        if current_size + param_size_mb > bucket_size_mb and current_bucket:
-            buckets.append(current_bucket)
-            current_bucket = [param]
-            current_size = param_size_mb
-        else:
-            current_bucket.append(param)
-            current_size += param_size_mb
-
-    if current_bucket:
-        buckets.append(current_bucket)
-
-    return buckets
-
-# Create buckets for all parameters
-all_params = [p for p in model.parameters() if p.requires_grad]
-param_buckets = create_buckets(all_params)
-
-print0(f"Created {len(param_buckets)} gradient buckets")
-for i, bucket in enumerate(param_buckets):
-    total_size = sum(p.numel() * p.element_size() for p in bucket) / (1024 * 1024)
-    print0(f"Bucket {i}: {len(bucket)} params, {total_size:.1f} MB")
-
-# Bucket state tracking
-bucket_ready_count = [0] * len(param_buckets)
-bucket_handles = [None] * len(param_buckets)
+# Global state for gradient bucketing
+bucket_ready_count = []
+bucket_handles = []
 param_to_bucket = {}
-
-# Map each parameter to its bucket index
-for bucket_idx, bucket in enumerate(param_buckets):
-    for param in bucket:
-        param_to_bucket[param] = bucket_idx
+param_buckets = []
 
 def _gradient_hook(param: Tensor):
     """Called when a parameter's gradient is ready"""
+    global bucket_ready_count, bucket_handles, param_to_bucket, param_buckets
     if param.grad is None:
         return
 
@@ -636,10 +644,43 @@ def _gradient_hook(param: Tensor):
 
         bucket_handles[bucket_idx] = handle
 
-# Register hooks for all parameters
-print0("Registering bucketed gradient hooks...")
-for param in all_params:
-    param.register_post_accumulate_grad_hook(_gradient_hook)
+def setup_gradient_hooks(model_to_hook, bucket_size_mb=25):
+    """Create buckets and register hooks for a given model."""
+    global bucket_ready_count, bucket_handles, param_to_bucket, param_buckets
+
+    def create_buckets(params, bucket_size_mb):
+        buckets = []
+        current_bucket = []
+        current_size = 0
+        sorted_params = sorted(params, key=lambda p: p.numel(), reverse=True)
+        for param in sorted_params:
+            param_size_mb = param.numel() * param.element_size() / (1024 * 1024)
+            if current_size + param_size_mb > bucket_size_mb and current_bucket:
+                buckets.append(current_bucket)
+                current_bucket = [param]
+                current_size = param_size_mb
+            else:
+                current_bucket.append(param)
+                current_size += param_size_mb
+        if current_bucket:
+            buckets.append(current_bucket)
+        return buckets
+
+    all_params = [p for p in model_to_hook.parameters() if p.requires_grad]
+    param_buckets = create_buckets(all_params, bucket_size_mb)
+    print0(f"Re-initializing hooks for {len(all_params)} params into {len(param_buckets)} buckets.")
+
+    bucket_ready_count = [0] * len(param_buckets)
+    bucket_handles = [None] * len(param_buckets)
+    param_to_bucket.clear()
+
+    for bucket_idx, bucket in enumerate(param_buckets):
+        for param in bucket:
+            param_to_bucket[param] = bucket_idx
+
+    for param in all_params:
+        param.register_post_accumulate_grad_hook(_gradient_hook)
+
 
 def wait_for_gradients():
     """Wait for all gradient reductions to complete and reset bucket state"""
@@ -655,6 +696,10 @@ def wait_for_gradients():
 ########################################
 #        Training and validation       #
 ########################################
+
+model = small_model # start with small model
+optimizers = small_optimizers 
+setup_gradient_hooks(model) # Initial setup for the small model
 
 train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
 training_time_ms = 0
@@ -692,12 +737,46 @@ for step in range(train_steps + 1):
 
     if last_step:
         if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in large_optimizers])
             os.makedirs(f"logs/{run_id}", exist_ok=True)
             torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
         break
 
+    if step == args.switch_step:
+        # switch to larger model and optimizersm print
+        t_start = time.perf_counter()
+        print0(f"Switching to larger model at step {step}", console=True)
+        upscale_gpts(small_model, large_model) # upscale the MLP weights
+        model = large_model
+        optimizers = large_optimizers
+        print0("Copying optimizer state for shared non-MLP block parameters...", console=True)
+        # Get the state dicts
+        state_dict_small = optimizer2_small.state_dict()
+        state_dict_large = optimizer2.state_dict()
+        
+        # Find the param_ids for hidden_matrix_params in the large optimizer
+        hidden_matrix_param_ids = {id(p) for p in hidden_matrix_params}
+        
+        # Map param_id to param_group index and param_index within the group
+        param_id_map_large = {}
+        for group_idx, group in enumerate(state_dict_large['param_groups']):
+            for param_idx, p_id in enumerate(group['params']):
+                if p_id in hidden_matrix_param_ids:
+                    param_id_map_large[p_id] = (group_idx, param_idx)
+
+        # Copy the state from small to large
+        for group_idx_s, group_s in enumerate(state_dict_small['param_groups']):
+            for param_idx_s, p_id_s in enumerate(group_s['params']):
+                if p_id_s in hidden_matrix_param_ids:
+                    if p_id_s in param_id_map_large:
+                        # This parameter exists in both, copy its state
+                        state_to_copy = state_dict_small['state'][p_id_s]
+                        state_dict_large['state'][p_id_s] = copy.deepcopy(state_to_copy)
+
+        optimizer2.load_state_dict(state_dict_large)
+        setup_gradient_hooks(model)
+        print0(f"Switching to larger model took {1000 * (time.perf_counter() - t_start):.2f} ms", console=True)
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(step)).backward()
