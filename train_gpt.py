@@ -395,15 +395,18 @@ class GPT(nn.Module):
             if i >= n:
                 x = x + self.skip_weights[i - n] * skip_connections.pop()
             x = self.blocks[i](x, ve[i], x0, block_masks[i])
+            if i == 9:
+                tenth_x = x
             if i < n:
                 skip_connections.append(x)
-
+        last_x = x
         x = norm(x)
         logits = self.lm_head(x).float()
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction='sum' if self.training else 'mean')
-        return loss
+        aux_loss = (tenth_x - last_x.detach()).pow(2).mean() # TODO we have no idea about correct scale of this
+        return loss + 0.1 * aux_loss
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
