@@ -298,11 +298,12 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int, mlp_multiplier: int):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int, mlp_multiplier: int, mlp_edge_multiplier: int):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
-        self.mlp = MLP(dim, mlp_multiplier)
+        self.actual_mlp_multiplier = mlp_edge_multiplier if layer_idx in [0, 11] else mlp_multiplier
+        self.mlp = MLP(dim, self.actual_mlp_multiplier)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
@@ -319,13 +320,16 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, mlp_multiplier: int = 4):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int,
+                 mlp_multiplier: int = 4, mlp_edge_multiplier: int = 4):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i, mlp_multiplier=mlp_multiplier) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i,
+                                           mlp_multiplier=mlp_multiplier,
+                                           mlp_edge_multiplier=mlp_edge_multiplier) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128),
@@ -421,14 +425,20 @@ def bind_gpts(smaller: GPT, larger: GPT):
         # we do not bind the MLP, so the MLPs are different
 
 def upscale_gpts(smaller: GPT, larger: GPT):
-    # in smaller GPT we have MLP with mlp_multiplier smaller than in larger GPT
-    # so basically there are more weights in larger MLP than in smaller MLP
-    # now we need to copy all MLP weights from smaller to larger (leave all untouched weigths in larger MLP uninitialized)
+    # first and last are copied
+    larger.blocks[0].mlp.c_fc.weight.data[:, :] = smaller.blocks[0].mlp.c_fc.weight.data
+    larger.blocks[11].mlp.c_fc.weight.data[:, :] = smaller.blocks[11].mlp.c_fc.weight.data
 
-    # all blocks has the same shape, and gpt share dim
+    # all other blocks has the same shape, and gpt share dim
     hdim_small = smaller.blocks[0].mlp.c_fc.weight.shape[0]
-    for i in range(len(smaller.blocks)):
-        larger.blocks[i].mlp.c_fc.weight.data[:hdim_small, :] = smaller.blocks[i].mlp.c_fc.weight.data
+    for i in range(1, len(smaller.blocks)-1):
+        # first copy to odd and even layers 11th and 0th copies correspondingly
+        if i % 2:
+            larger.blocks[i].mlp.c_fc.weight.data[:, :] = smaller.blocks[11].mlp.c_fc * c1.weight.data
+        else:
+            larger.blocks[i].mlp.c_fc.weight.data[:, :] = smaller.blocks[0].mlp.c_fc * c1.weight.data
+        # then update with actually trained data
+        larger.blocks[i].mlp.c_fc.weight.data[:hdim_small, :]   = smaller.blocks[i].mlp.c_fc.weight.data 
         larger.blocks[i].mlp.c_proj.weight.data[:, :hdim_small] = smaller.blocks[i].mlp.c_proj.weight.data
 
 
@@ -633,8 +643,19 @@ def _gradient_hook(param: Tensor):
     # Check if all parameters in this bucket are ready
     if bucket_ready_count[bucket_idx] == len(param_buckets[bucket_idx]):
         # All-reduce this bucket
-        bucket_grads = [p.grad for p in param_buckets[bucket_idx]]
-
+        bucket_grads = []
+        valid_count = 0
+        # TODO: something is wrong with this. after upscale grad for mlp parameters at least in 11th block is None
+        # need to be revisited
+        for p in param_buckets[bucket_idx]:
+            if p.grad is not None:
+                bucket_grads.append(p.grad)
+                valid_count += 1
+            else:
+                # For parameters with None gradients, create a zero tensor of the right shape
+                # This ensures we have the correct number of tensors for all_reduce_coalesced
+                bucket_grads.append(torch.zeros_like(p.data.view(-1)))
+        
         # For multi-tensor operations, we can reduce them together
         if len(bucket_grads) == 1:
             handle = dist.all_reduce(bucket_grads[0], op=dist.ReduceOp.AVG, async_op=True)
@@ -647,6 +668,19 @@ def _gradient_hook(param: Tensor):
 def setup_gradient_hooks(model_to_hook, bucket_size_mb=25):
     """Create buckets and register hooks for a given model."""
     global bucket_ready_count, bucket_handles, param_to_bucket, param_buckets
+
+    # Clear any existing hooks - handle None parameters gracefully
+    for param in list(param_to_bucket.keys()):
+        if param is not None:
+            try:
+                # Remove all hooks from this parameter
+                if hasattr(param, '_backward_hooks'):
+                    param._backward_hooks.clear()
+                if hasattr(param, '_backward_pre_hooks'):
+                    param._backward_pre_hooks.clear()
+            except:
+                # If anything goes wrong, just skip this parameter
+                pass
 
     def create_buckets(params, bucket_size_mb):
         buckets = []
@@ -765,7 +799,7 @@ for step in range(train_steps + 1):
                 if p_id in hidden_matrix_param_ids:
                     param_id_map_large[p_id] = (group_idx, param_idx)
 
-        # Copy the state from small to large
+        # Copy the state from small to large #TODO copy state for second half of MLPs
         for group_idx_s, group_s in enumerate(state_dict_small['param_groups']):
             for param_idx_s, p_id_s in enumerate(group_s['params']):
                 if p_id_s in hidden_matrix_param_ids:
@@ -777,6 +811,28 @@ for step in range(train_steps + 1):
         optimizer2.load_state_dict(state_dict_large)
         setup_gradient_hooks(model)
         print0(f"Switching to larger model took {1000 * (time.perf_counter() - t_start):.2f} ms", console=True)
+        if True: # lets validate yet another time to check whether it has the same loss after upscaling
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            model.eval()
+            val_batch_size = world_size * args.val_seq_len
+            assert args.val_tokens % val_batch_size == 0
+            val_steps = args.val_tokens // val_batch_size
+            val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
+            val_loss = 0
+            with torch.no_grad():
+                for _ in range(val_steps):
+                    inputs, targets = next(val_loader)
+                    val_loss += model(inputs, targets, get_window_size_blocks(step))
+            val_loss /= val_steps
+            del val_loader
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            model.train()
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(step)).backward()
