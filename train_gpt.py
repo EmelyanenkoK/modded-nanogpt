@@ -20,6 +20,10 @@ import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 
+SKIPPED_MLP_BLOCKS = [0, 7, 12]
+DOUBLED_MLP_BLOCKS = [6]
+
+
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
@@ -355,18 +359,58 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
+
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         hdim = 4 * dim
-        self.c_fc = CastedLinear(dim, hdim)
-        self.c_proj = CastedLinear(hdim, dim)
-        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        # make both matrices have the same shape because optimizer sorts params by shape
+        # 2 matrices x 12 layers = 24 total, which is divisible by 8 GPU world size
+        self.c_fc = nn.Parameter(torch.empty(dim, hdim))
+        self.c_proj = nn.Parameter(torch.empty(dim, hdim))
+        std = 0.5 * (dim ** -0.5)
+        bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
+        with torch.no_grad():
+            self.c_fc.uniform_(-bound, bound)
+            self.c_proj.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x: Tensor):
-        x = self.c_fc(x)
+        x = F.linear(x, self.c_fc.T.type_as(x))
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x)
+        x = F.linear(x, self.c_proj.type_as(x))
+        return x
+
+
+class DoubledMLP(nn.Module):
+    # we want to make 2layer perceptron:
+    # upscale dim -> 4*dim -> 4*dim -> dim
+    # however we want to keep all parameters of nn.Parameter(torch.empty(dim, hdim)) shape
+    # so for intermediate layer we will initialize 4 matrices of shape (dim, 4*dim) and manually implement forward
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.c_fc = nn.Parameter(torch.empty(dim, hdim))
+        self.c_proj = nn.Parameter(torch.empty(dim, hdim))
+        self.c_intermediate1 = nn.Parameter(torch.empty(dim, hdim))
+        self.c_intermediate2 = nn.Parameter(torch.empty(dim, hdim))
+        self.c_intermediate3 = nn.Parameter(torch.empty(dim, hdim))
+        self.c_intermediate4 = nn.Parameter(torch.empty(dim, hdim))        
+        std = 0.5 * (dim ** -0.5)
+        bound = (3 ** 0.5) * std
+        with torch.no_grad():
+            self.c_fc.uniform_(-bound, bound)
+            self.c_proj.zero_()
+            self.c_intermediate1.uniform_(-bound, bound)
+            self.c_intermediate2.uniform_(-bound, bound)
+            self.c_intermediate3.uniform_(-bound, bound)
+            self.c_intermediate4.uniform_(-bound, bound)
+
+    def forward(self, x: Tensor):
+        x = F.linear(x, self.c_fc.T.type_as(x))
+        x = F.relu(x).square()
+        x = F.linear(x, torch.cat([self.c_intermediate1, self.c_intermediate2, self.c_intermediate3, self.c_intermediate4], dim=0).T.type_as(x))
+        x = F.relu(x).square()
+        x = F.linear(x, self.c_proj.type_as(x))
         return x
 
 class Block(nn.Module):
@@ -374,13 +418,14 @@ class Block(nn.Module):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
-        self.mlp = MLP(dim)
+        self.mlp = None if layer_idx in SKIPPED_MLP_BLOCKS else (DoubledMLP(dim) if layer_idx in DOUBLED_MLP_BLOCKS else MLP(dim))
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor, sa_lambdas: Tensor, block_mask: BlockMask):
         x = lambdas[0] * x + lambdas[1] * x0
         if self.attn is not None:
             x = x + self.attn(norm(x), ve, sa_lambdas, block_mask)
-        x = x + self.mlp(norm(x))
+        if self.mlp is not None:
+            x = x + self.mlp(norm(x))
         return x
 
 # -----------------------------------------------------------------------------
