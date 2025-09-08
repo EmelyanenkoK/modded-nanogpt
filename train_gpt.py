@@ -609,7 +609,15 @@ class CausalSelfAttention(nn.Module):
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         if ve is not None:
-            v = lambdas[0] * v + lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
+            # ve may have different dimension than v, but lets assume it is integer times smaller and that we can just repeat
+            # ve: [T, dim] -> [B, T, dim] -> [B, T, H, D]
+            ve_bt = ve[None, :, :].type_as(v)  # [B, T, VeDim]
+            total = self.num_heads * self.head_dim
+            if ve_bt.size(-1) != total:
+                assert total % ve_bt.size(-1) == 0, "ve last dim must divide H*D"
+                ve_bt = ve_bt.repeat_interleave(total // ve_bt.size(-1), dim=-1)
+            ve_bt = ve_bt.view(B, T, self.num_heads, self.head_dim)
+            v = lambdas[0] * v + lambdas[1] * ve_bt
         else: # skip mid-layers token value embeddings by @YouJiacheng
             v = lambdas[0] * v
 
@@ -621,18 +629,20 @@ class CausalSelfAttention(nn.Module):
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_dim])).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = F.linear(y, self.qkvo_w[3].type_as(y))
+        y = F.linear(y, self.qkvo_w[3].T.type_as(y))
         return y
 
 class MLP(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, input_dim: int, output_dim: int = None):
         super().__init__()
-        hdim = 4 * dim
+        if output_dim is None:
+            output_dim = input_dim
+        hdim = 4 * input_dim
         # make both matrices have the same shape because optimizer sorts params by shape
         # 2 matrices x 12 layers = 24 total, which is divisible by 8 GPU world size
-        self.c_fc = nn.Parameter(torch.empty(dim, hdim))
-        self.c_proj = nn.Parameter(torch.empty(dim, hdim))
-        std = 0.5 * (dim ** -0.5)
+        self.c_fc = nn.Parameter(torch.empty(input_dim, hdim))
+        self.c_proj = nn.Parameter(torch.empty(output_dim, hdim)) if not output_dim == hdim else None
+        std = 0.5 * (input_dim ** -0.5)
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
         with torch.no_grad():
             self.c_fc.uniform_(-bound, bound)
@@ -641,25 +651,50 @@ class MLP(nn.Module):
     def forward(self, x: Tensor):
         x = F.linear(x, self.c_fc.T.type_as(x))
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = F.linear(x, self.c_proj.type_as(x))
+        if self.c_proj is not None:
+            x = F.linear(x, self.c_proj.type_as(x))
         return x
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
+    def __init__(self, input_dim: int, num_heads: int, max_seq_len: int, layer_idx: int, output_dim:int = None):
         super().__init__()
+        if output_dim is None:
+            output_dim = input_dim
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
+        self.attn = CausalSelfAttention(input_dim, num_heads, max_seq_len) if layer_idx != 7 else None
         SKIPPED_MLP_BLOCKS = [0, 12] # skip MLP blocks for first and last layers by @EmelyanenkoK
-        self.mlp = None if layer_idx in SKIPPED_MLP_BLOCKS else MLP(dim)
+        mlp_input_dim = num_heads * 128
+        self.mlp = None if layer_idx in SKIPPED_MLP_BLOCKS else MLP(mlp_input_dim, output_dim)
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.residual_proj = None
+        if self.mlp is not None and output_dim != input_dim:
+            # project residual to match widened MLP output
+            self.residual_proj = nn.Parameter(torch.empty(output_dim, input_dim))
+            std = 0.5 * (input_dim ** -0.5)
+            bound = (3 ** 0.5) * std
+            with torch.no_grad():
+                self.residual_proj.uniform_(-bound, bound)
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor, sa_lambdas: Tensor,
                 seqlens: Tensor, bm_size: int):
-        x = lambdas[0] * x + lambdas[1] * x0
+        # mix global residual, align x0 if widths differ
+        if x0.size(-1) != x.size(-1):
+            assert x.size(-1) % x0.size(-1) == 0
+            x0_aligned = x0.repeat_interleave(x.size(-1) // x0.size(-1), dim=-1)
+        else:
+            x0_aligned = x0
+        x = lambdas[0] * x + lambdas[1] * x0_aligned
         if self.attn is not None:
             x = x + self.attn(norm(x), ve, sa_lambdas, seqlens, bm_size)
         if self.mlp is not None:
-            x = x + self.mlp(norm(x))
+            mlp_out = self.mlp(norm(x))
+            if mlp_out.size(-1) == x.size(-1):
+                x = x + mlp_out
+            else:
+                assert self.residual_proj is not None
+                x = F.linear(x, self.residual_proj.type_as(x)) + mlp_out
         return x
 
 # -----------------------------------------------------------------------------
@@ -676,11 +711,19 @@ class GPT(nn.Module):
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
+        last_layer_multiplier = 4 # widen last layer by 4x for capacity, suggested by ....
+        last_layer_dim = last_layer_multiplier * model_dim
+        # heads must satisfy heads * head_dim(=128) == width
+        heads_last = last_layer_dim // 128
+        assert heads_last * 128 == last_layer_dim, "last_layer_dim must be a multiple of 128"
+
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers-2)]+
+                                    [Block(model_dim, num_heads, max_seq_len, num_layers-2, output_dim=last_layer_dim)]+
+                                    [Block(last_layer_dim, heads_last, max_seq_len, num_layers-1, output_dim=last_layer_dim)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
-        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8, x_s=(model_dim**0.5)/448, w_s=2**-9, grad_s=1/448)
+        self.lm_head = CastedLinear(last_layer_dim, vocab_size, use_fp8=use_fp8, x_s=(last_layer_dim**0.5)/448, w_s=2**-9, grad_s=1/448)
         self.lm_head.weight.detach().zero_() # @Grad62304977
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
@@ -724,7 +767,13 @@ class GPT(nn.Module):
 
         for i in range(len(self.blocks)):
             if i >= n:
-                x = x + skip_weights[i - n] * skip_connections.pop()
+                # skip connection may has different different dimension, let's just repeat it
+                skip = skip_connections.pop()
+                actual_skip = skip
+                if skip.size(-1) != x.size(-1):
+                    assert skip.size(-1) < x.size(-1) and x.size(-1) % skip.size(-1) == 0
+                    actual_skip = skip.repeat_interleave(x.size(-1) // skip.size(-1), dim=-1)
+                x = x + skip_weights[i - n] * actual_skip
             x = self.blocks[i](x, ve[i], x0, lambdas[i], sa_lambdas[i], seqlens, bm_sizes[i])
             if i < n:
                 skip_connections.append(x)
