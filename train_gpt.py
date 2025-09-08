@@ -380,7 +380,11 @@ class MLP(nn.Module):
         x = F.linear(x, self.c_proj.type_as(x))
         return x
 
-
+INTERMEDIATE_ADD_DIAGONAL = False
+INTERMEDIATE_ZERO_INIT = False
+NORM_AFTER_FIRST_NL = False
+NORM_AFTER_INTERMEDIATE = False
+ADD_PSEUDO_RESIDUAL = False
 class DoubledMLP(nn.Module):
     # we want to make 2layer perceptron:
     # upscale dim -> 4*dim -> 4*dim -> dim
@@ -388,6 +392,9 @@ class DoubledMLP(nn.Module):
     # so for intermediate layer we will initialize 4 matrices of shape (dim, 4*dim) and manually implement forward
     def __init__(self, dim: int):
         super().__init__()
+        self.dim = dim
+        if ADD_PSEUDO_RESIDUAL:
+          self.lambda_ = nn.Parameter(torch.tensor(0.5))
         hdim = 4 * dim
         self.c_fc = nn.Parameter(torch.empty(dim, hdim))
         self.c_proj = nn.Parameter(torch.empty(dim, hdim))
@@ -400,17 +407,36 @@ class DoubledMLP(nn.Module):
         with torch.no_grad():
             self.c_fc.uniform_(-bound, bound)
             self.c_proj.zero_()
-            self.c_intermediate1.uniform_(-bound, bound)
-            self.c_intermediate2.uniform_(-bound, bound)
-            self.c_intermediate3.uniform_(-bound, bound)
-            self.c_intermediate4.uniform_(-bound, bound)
+            if not INTERMEDIATE_ZERO_INIT:
+                self.c_intermediate1.uniform_(-bound, bound)
+                self.c_intermediate2.uniform_(-bound, bound)
+                self.c_intermediate3.uniform_(-bound, bound)
+                self.c_intermediate4.uniform_(-bound, bound)
+            else:
+                self.c_intermediate1.zero_()
+                self.c_intermediate2.zero_()
+                self.c_intermediate3.zero_()
+                self.c_intermediate4.zero_()
+            if INTERMEDIATE_ADD_DIAGONAL:
+                mids = [self.c_intermediate1, self.c_intermediate2,
+                        self.c_intermediate3, self.c_intermediate4]
+                for k, W in enumerate(mids):
+                    W.diagonal(offset=k*dim, dim1=0, dim2=1).fill_(1.0)
 
     def forward(self, x: Tensor):
-        x = F.linear(x, self.c_fc.T.type_as(x))
-        x = F.relu(x).square()
-        x = F.linear(x, torch.cat([self.c_intermediate1, self.c_intermediate2, self.c_intermediate3, self.c_intermediate4], dim=0).T.type_as(x))
-        x = F.relu(x).square()
-        x = F.linear(x, self.c_proj.type_as(x))
+        y = F.linear(x, self.c_fc.T.type_as(x))
+        y = F.relu(y).square()
+        if NORM_AFTER_FIRST_NL:
+            y = norm(y)
+        y = F.linear(y, torch.cat([self.c_intermediate1, self.c_intermediate2, self.c_intermediate3, self.c_intermediate4], dim=0).T.type_as(x))
+        if NORM_AFTER_INTERMEDIATE:
+            y = norm(y)
+        if ADD_PSEUDO_RESIDUAL:
+            y = y.reshape(*y.shape[:-1], 4, self.dim)
+            y = y + x.unsqueeze(-2) * self.lambda_
+            y = y.reshape(*y.shape[:-2], 4*self.dim)
+        y = F.relu(y).square()
+        x = F.linear(y, self.c_proj.type_as(x))
         return x
 
 class Block(nn.Module):
