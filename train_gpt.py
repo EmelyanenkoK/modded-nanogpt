@@ -621,7 +621,7 @@ class CausalSelfAttention(nn.Module):
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_dim])).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = F.linear(y, self.qkvo_w[3].type_as(y))
+        y = F.linear(y, self.qkvo_w[3].T.type_as(y))
         return y
 
 class MLP(nn.Module):
@@ -662,6 +662,40 @@ class Block(nn.Module):
             x = x + self.mlp(norm(x))
         return x
 
+class VariableBlock(nn.Module):
+    """
+     A block where we can have a few independent attention and MLP sublayers working in parallel
+     and combined back to common model dimension via projection.
+    """
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, attn_paths:int = 1, mlp_paths:int = 1):
+        super().__init__()
+        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
+        self.attn = nn.ModuleList([CausalSelfAttention(dim, num_heads, max_seq_len) for _ in range(attn_paths)])
+        self.attn_project = CastedLinear(attn_paths * dim, dim) if attn_paths > 1 else None
+        self.mlp = nn.ModuleList([MLP(dim) for _ in range(mlp_paths)])
+        self.mlp_project = CastedLinear(mlp_paths * dim, dim) if mlp_paths > 1 else None
+
+    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor, sa_lambdas: Tensor,
+                seqlens: Tensor, bm_size: int):
+        x = lambdas[0] * x + lambdas[1] * x0
+        if len(self.attn) > 0:
+            attn_outs = [attn(norm(x), ve, sa_lambdas, seqlens, bm_size) for attn in self.attn]
+            if self.attn_project is not None:
+                attn_out = torch.cat(attn_outs, dim=-1)
+                attn_out = self.attn_project(attn_out)
+            else:
+                attn_out = attn_outs[0]
+            x = x + attn_out
+        if len(self.mlp) > 0:
+            mlp_outs = [mlp(norm(x)) for mlp in self.mlp]
+            if self.mlp_project is not None:
+                mlp_out = torch.cat(mlp_outs, dim=-1)
+                mlp_out = self.mlp_project(mlp_out)
+            else:
+                mlp_out = mlp_outs[0]
+            x = x + mlp_out
+        return x
+
 # -----------------------------------------------------------------------------
 # The main model
 
@@ -676,7 +710,14 @@ class GPT(nn.Module):
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([
+            VariableBlock(model_dim, 
+                          num_heads, 
+                          max_seq_len, 
+                          attn_paths=int(i not in [7]), 
+                          mlp_paths=int(i not in [0]))
+            for i in range(num_layers)
+        ])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
