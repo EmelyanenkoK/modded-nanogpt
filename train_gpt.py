@@ -1479,11 +1479,37 @@ for step in range(train_steps + 1):
                 f"{name}:{lr:.6g}" for name, lr in zip(names, eff_lrs)
             )
             info = diag_cache[opt_idx][group_idx]
+
+            # Compute RMS-based diagnostics and cosine similarity
+            eps = 1e-12
+            gpre = info["pre_grad"]
+            gpost = info["post_grad"]
+            pbefore = info["param_before"]
+            pafter = info["param_after"]
+            dgrad = gpost - gpre
+            dtheta = pafter - pbefore
+
+            def _rms_cpu(t: torch.Tensor) -> float:
+                n = max(1, t.numel())
+                return t.norm().item() / math.sqrt(n)
+
+            rms_dgrad = _rms_cpu(dgrad)
+            rms_dtheta = _rms_cpu(dtheta)
+            rms_gpre = _rms_cpu(gpre)
+            rms_pbefore = _rms_cpu(pbefore)
+
+            lhat = rms_dgrad / (rms_dtheta + eps)              # gradient change per unit parameter move
+            rho = rms_dgrad / (rms_gpre + eps)                 # relative grad change
+            utr = rms_dtheta / (rms_pbefore + eps)             # update-to-weight ratio
+            denom = gpre.norm().item() * gpost.norm().item()
+            cosine = float(torch.dot(gpre, gpost).item() / (denom + eps))
+
             log_msg = (
                 f"lr_tune step:{step} opt:{opt_idx} group:{group_idx} metric:{metric:.6g} "
                 f"grad_pre:{_safe_norm(info['pre_grad']):.6g} grad_post:{_safe_norm(info['post_grad']):.6g} "
                 f"grad_delta:{grad_delta_norm:.6g} param_delta:{param_delta_norm:.6g} "
-                f"factor:{factor:.6g} baseline_lr:{group['lr_baseline']:.6g} lrs:[{lr_entries}]"
+                f"factor:{factor:.6g} baseline_lr:{group['lr_baseline']:.6g} lrs:[{lr_entries}] "
+                f"lhat:{lhat:.6g} rho:{rho:.6g} utr:{utr:.6g} cos:{cosine:.6g}"
             )
             print0(log_msg)
         model.zero_grad(set_to_none=True)
