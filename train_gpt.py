@@ -1164,6 +1164,9 @@ class Hyperparameters:
     ws_schedule: tuple = (3, 7, 11)
     ws_validate: int = 13 # increase final validation ws @classiclarryd
     ws_validate_final_layer: int = 20 # final layer shows no degradation with context length
+    lr_tuning_steps: int = 50
+    lr_tuning_min_factor: float = 0.5
+    lr_tuning_max_factor: float = 3.0
 
 args = Hyperparameters()
 
@@ -1231,6 +1234,7 @@ embed_params = [p for n, p in model.named_parameters() if "embed" in n]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 smear_gate_params = [p for n, p in model.named_parameters() if "smear" in n]
+param_name_lookup = {id(p): n for n, p in model.named_parameters()}
 
 # init the optimizer(s)
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
@@ -1247,6 +1251,28 @@ optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
+
+lr_group_infos: list[dict] = []
+lr_group_lookup: dict[tuple[int, int], dict] = {}
+for opt_idx, opt in enumerate(optimizers):
+    for group_idx, group in enumerate(opt.param_groups):
+        params = list(group["params"])
+        group_info = {
+            "optimizer_index": opt_idx,
+            "group_index": group_idx,
+            "group": group,
+            "params": params,
+            "names": [param_name_lookup.get(id(p), f"param_{i}") for i, p in enumerate(params)],
+            "prev_grad": None,
+            "prev_grad_norm": 0.0,
+            "has_history": False,
+            "had_prev_for_step": False,
+            "factor": 1.0,
+            "drift": 0.0,
+            "grad_norm": 0.0,
+        }
+        lr_group_infos.append(group_info)
+        lr_group_lookup[(opt_idx, group_idx)] = group_info
 
 # learning rate schedule: stable then decay
 def get_lr(step: int):
@@ -1277,6 +1303,73 @@ warmup_steps = 30
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
 train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+diagnostic_batch: tuple[Tensor, Tensor, Tensor] | None = None
+
+def _collect_group_gradient_vector(params: list[Tensor]) -> torch.Tensor:
+    grads = [
+        p.grad.detach().float().reshape(-1).cpu()
+        for p in params
+        if p.grad is not None
+    ]
+    if not grads:
+        return torch.zeros(0, dtype=torch.float32)
+    return torch.cat(grads)
+
+def run_lr_diagnostics(step: int, ws_curr: int, ws_final: int) -> bool:
+    if args.lr_tuning_steps <= 0:
+        return False
+    if step % args.lr_tuning_steps != 0:
+        return False
+    if diagnostic_batch is None:
+        return False
+
+    inputs, targets, cum_seqlens = diagnostic_batch
+    model.zero_grad(set_to_none=True)
+    loss = model(inputs, targets, cum_seqlens, ws_curr, ws_final)
+    loss.backward()
+
+    eligible_infos = []
+    for info in lr_group_infos:
+        params = info["params"]
+        grad_vec = _collect_group_gradient_vector(params)
+        curr_norm = float(grad_vec.norm().item()) if grad_vec.numel() > 0 else 0.0
+        prev_grad = info["prev_grad"]
+        prev_norm = info["prev_grad_norm"]
+        had_prev = info["has_history"] and prev_grad is not None and prev_grad.numel() > 0 and curr_norm > 0 and prev_norm > 0
+        if had_prev:
+            dot = torch.dot(prev_grad, grad_vec).item()
+            denom = max(prev_norm * curr_norm, 1e-12)
+            cos = max(min(dot / denom, 1.0), -1.0)
+            drift = 1.0 - cos
+            eligible_infos.append(info)
+        else:
+            drift = 0.0
+        info["drift"] = drift
+        info["grad_norm"] = curr_norm
+        info["had_prev_for_step"] = had_prev
+        info["prev_grad"] = grad_vec
+        info["prev_grad_norm"] = curr_norm
+        info["has_history"] = grad_vec.numel() > 0
+
+    if eligible_infos:
+        sorted_infos = sorted(eligible_infos, key=lambda x: x["drift"], reverse=True)
+        if len(sorted_infos) == 1:
+            factor = min(max(1.0, args.lr_tuning_min_factor), args.lr_tuning_max_factor)
+            sorted_infos[0]["factor"] = factor
+        else:
+            denom = len(sorted_infos) - 1
+            for rank_idx, info in enumerate(sorted_infos):
+                frac = rank_idx / denom
+                factor = args.lr_tuning_min_factor + frac * (args.lr_tuning_max_factor - args.lr_tuning_min_factor)
+                factor = float(max(args.lr_tuning_min_factor, min(factor, args.lr_tuning_max_factor)))
+                info["factor"] = factor
+    else:
+        for info in lr_group_infos:
+            if not info["has_history"]:
+                info["factor"] = 1.0
+
+    model.zero_grad(set_to_none=True)
+    return True
 ws=args.ws_schedule[0]
 for step in range(warmup_steps):
     inputs, targets, cum_seqlens = next(train_loader)
@@ -1302,6 +1395,7 @@ del train_loader, initial_state
 ########################################
 
 train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+diagnostic_batch = tuple(t.clone().detach() for t in next(train_loader))
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -1348,13 +1442,26 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+    did_run_lr_tuning = run_lr_diagnostics(step, ws, ws_final_layer)
     for _ in range(grad_accum_steps):
         inputs, targets, cum_seqlens = next(train_loader)
         model(inputs, targets, cum_seqlens, ws, ws_final_layer).backward()
     # set optimization hyperparameters
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
+    lr_multiplier = get_lr(step)
+    for opt_idx, opt in enumerate(optimizers):
+        for group_idx, group in enumerate(opt.param_groups):
+            base_lr = group["initial_lr"] * lr_multiplier
+            info = lr_group_lookup[(opt_idx, group_idx)]
+            group_factor = info["factor"] if info["factor"] is not None else 1.0
+            group["lr"] = base_lr * group_factor
+    if did_run_lr_tuning:
+        for info in lr_group_infos:
+            group = info["group"]
+            names_str = ",".join(info["names"])
+            print0(
+                f"step:{step} lr_tune opt:{info['optimizer_index']} group:{info['group_index']} lr:{group['lr']:.6e} "
+                f"factor:{info['factor']:.3f} drift:{info['drift']:.6f} grad_norm:{info['grad_norm']:.6e} params:{names_str}"
+            )
     for group in optimizer2.param_groups:
         frac = min(step / 300, 1) # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
