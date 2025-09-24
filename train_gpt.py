@@ -27,6 +27,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from flash_attn_interface import flash_attn_varlen_func
+from torch.nn.attention import flex_attention
 from torch import Tensor, nn
 
 dynamo.config.recompile_limit = 64
@@ -833,9 +834,34 @@ class CausalSelfAttention(nn.Module):
         # Concatenate along value dim: V | X | X_next  → single attention call
         v_cat = torch.cat([v, x_heads, x_next_heads], dim=-1)  # [B,T,H,3*Hd]
 
-        # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y_cat = flash_attn_varlen_func(q[0], k[0], v_cat[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens, max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                   causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
+        # Build a score modifier to enforce: same segment, causal, window bm_size
+        # seqlens: [num_docs+1], starts at 0, ends at T
+        token_ids = torch.arange(T, device=x.device, dtype=seqlens.dtype)
+        seg_ids = torch.bucketize(token_ids, seqlens) - 1  # [T], segment id per token
+
+        def score_mod(scores, b, h, q_idx, kv_idx):
+            # q_idx/kv_idx are indices along T-dimension
+            same_seg = seg_ids[q_idx] == seg_ids[kv_idx]
+            causal = kv_idx <= q_idx
+            if bm_size > 0:
+                lb = torch.maximum(q_idx - torch.as_tensor(bm_size - 1, device=q_idx.device, dtype=q_idx.dtype),
+                                   torch.tensor(0, device=q_idx.device, dtype=q_idx.dtype))
+                in_win = kv_idx >= lb
+                keep = same_seg & causal & in_win
+            else:
+                keep = same_seg & causal
+            neg_inf = torch.finfo(scores.dtype).min
+            return torch.where(keep, scores, neg_inf)
+
+        # flex_attention expects [B,H,T,D*]
+        y_cat = flex_attention(
+            q.transpose(1, 2),  # [B,H,T,D]
+            k.transpose(1, 2),  # [B,H,T,D]
+            v_cat.transpose(1, 2),  # [B,H,T,3D]
+            score_mod=score_mod,
+            block_mask=None,
+            scale=attn_scale,
+        ).transpose(1, 2)  # -> [B,T,H,3D]
         
         # Split into components
         y_v, y_res, y_next = torch.split(y_cat, self.head_dim, dim=-1)  # each [B,T,H,Hd]
