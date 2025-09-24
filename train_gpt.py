@@ -776,6 +776,9 @@ class AttnArgs:
     cos: torch.Tensor
     sin: torch.Tensor
     attn_scale: float
+    inductive_mix_value: torch.Tensor
+    inductive_mix_same: torch.Tensor
+    inductive_mix_next: torch.Tensor
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int):
@@ -814,12 +817,31 @@ class CausalSelfAttention(nn.Module):
         else: # skip mid-layers token value embeddings by @YouJiacheng
             v = sa_lambdas[0] * v
 
+        # Residual-as-values, per head
+        # x is the residual stream entering attention; reshape to value-like
+        x_heads = x.view(B, T, self.num_heads, self.head_dim).type_as(v)  # [B,T,H,Hd]
+
+        # Shifted residual: for key index n, use x[n+1]; last position padded with zeros
+        # x_next_heads[t=n] = x_heads[n+1]; x_next_heads[last] = 0
+        x_next_heads = torch.cat(
+            [x_heads[:, 1:, :, :], torch.zeros_like(x_heads[:, :1, :, :])],
+            dim=1
+        )  # [B,T,H,Hd]
+
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
+        # Concatenate along value dim: V | X | X_next  → single attention call
+        v_cat = torch.cat([v, x_heads, x_next_heads], dim=-1)  # [B,T,H,3*Hd]
+
         # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens, max_seqlen_q=max_len, max_seqlen_k=max_len,
+        y_cat = flash_attn_varlen_func(q[0], k[0], v_cat[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens, max_seqlen_q=max_len, max_seqlen_k=max_len,
                                    causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
-        y = y.view(B, T, self.num_heads, self.head_dim)
+        
+        # Split into components
+        y_v, y_res, y_next = torch.split(y_cat, self.head_dim, dim=-1)  # each [B,T,H,Hd]
+
+        y = attn_args.inductive_mix_value * y_v + attn_args.inductive_mix_same * y_res + attn_args.inductive_mix_next * y_next
+
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, self.qkvo_w[3].type_as(y))
@@ -900,6 +922,9 @@ class GPT(nn.Module):
                     ],  # SA lambdas
                     torch.zeros(num_layers), #extra zeros params for smear_lambda
                     torch.ones(pad),
+                    torch.ones(num_layers), # inductive mix for value
+                    0.01 * torch.ones(num_layers), # inductive mix for same 
+                    0.01 * torch.ones(num_layers), # inductive mix for next
                 ]
             )
         )
@@ -938,6 +963,11 @@ class GPT(nn.Module):
         lambdas = self.scalars[1 * len(self.blocks): 3 * len(self.blocks)].view(-1, 2)
         sa_lambdas = self.scalars[3 * len(self.blocks): 5 * len(self.blocks)].view(-1, 2)
 
+        #inductive mix value/same/next
+        imv = self.scalars[6 * len(self.blocks):7 * len(self.blocks)]
+        ims = self.scalars[7 * len(self.blocks):8 * len(self.blocks)]
+        imn = self.scalars[8 * len(self.blocks):9 * len(self.blocks)]
+
         n = len(self.blocks) // 2
 
         for i in range(len(self.blocks)):
@@ -948,7 +978,10 @@ class GPT(nn.Module):
                 bm_size=bm_sizes[i],
                 cos=self.yarn.cos,
                 sin=self.yarn.sin,
-                attn_scale=self.yarn.attn_scale
+                attn_scale=self.yarn.attn_scale,
+                inductive_mix_value=imv[i],
+                inductive_mix_same=ims[i],
+                inductive_mix_next=imn[i]
             )
             if i >= n:
                 gate = torch.sigmoid(skip_weights[i - n])  # in (0, 1)
@@ -1366,6 +1399,15 @@ for step in range(train_steps + 1):
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    # lets also print inductive_mix_value/same/next values through print0
+    if master_process:
+        imv = model.scalars[6 * len(model.blocks):7 * len(model.blocks)]
+        ims = model.scalars[7 * len(model.blocks):8 * len(model.blocks)]
+        imn = model.scalars[8 * len(model.blocks):9 * len(model.blocks)]
+        print0(f"inductive_mix_value: {imv.detach().cpu().numpy()}", console=True)
+        print0(f"inductive_mix_same:  {ims.detach().cpu().numpy()}", console=True)
+        print0(f"inductive_mix_next:  {imn.detach().cpu().numpy()}", console=True)
+
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
