@@ -609,7 +609,24 @@ class CausalSelfAttention(nn.Module):
             v = lambdas[0] * v + lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
             v = lambdas[0] * v
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=0.12).transpose(1, 2)
+        
+        x_heads = x.view(B, T, self.num_heads, self.head_dim).type_as(v)  # [B,T,H,Hd]
+        # Shifted residual: for key index n, use x[n+1]; last position padded with zeros
+        # x_next_heads[t=n] = x_heads[n+1]; x_next_heads[last] = 0
+        x_next_heads = torch.cat(
+            [x_heads[:, 1:, :, :], torch.zeros_like(x_heads[:, :1, :, :])],
+            dim=1
+        )  # [B,T,H,Hd]
+
+        # Concatenate along value dim: V | X | X_next  → single attention call
+        v_cat = torch.cat([v, x_heads, x_next_heads], dim=-1)  # [B,T,H,3*Hd]
+
+
+        y_cat = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v_cat.transpose(1, 2),
+                               block_mask=block_mask, scale=0.12).transpose(1, 2)
+        y_v, y_res, y_next = torch.split(y_cat, self.head_dim, dim=-1)  # each [B,T,H,Hd]
+        y = lambdas[2] * y_v + lambdas[3] * y_res + lambdas[4] * y_next  # [B,T,H,Hd]
+
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_dim])).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
@@ -676,7 +693,7 @@ class GPT(nn.Module):
         self.scalars = nn.Parameter(torch.cat([
             torch.ones(num_layers), # skip_weights
             *[torch.tensor([1.0, 0.0]) for _ in range(num_layers)], # block lambdas
-            *[torch.tensor([0.5, 0.5]) for _ in range(num_layers)], # SA lambdas
+            *[torch.tensor([0.5, 0.5, 1, 0.01, 0.01]) for _ in range(num_layers)], # SA lambdas
             torch.ones(pad),
         ]))
         # set learning rates
@@ -745,7 +762,7 @@ class GPT(nn.Module):
         skip_connections = []
         skip_weights = self.scalars[:(len(self.blocks) // 2)]
         lambdas = self.scalars[1 * len(self.blocks): 3 * len(self.blocks)].view(-1, 2)
-        sa_lambdas = self.scalars[3 * len(self.blocks): 5 * len(self.blocks)].view(-1, 2)
+        sa_lambdas = self.scalars[3 * len(self.blocks): 8 * len(self.blocks)].view(-1, 5)
 
         n = len(self.blocks) // 2
 
@@ -1014,6 +1031,11 @@ for step in range(train_steps + 1):
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    # lets also print sa_lambdas
+    if master_process:
+        sa_lambdas = model.scalars[3 * len(model.blocks): 8 * len(model.blocks)].view(-1, 5).detach().cpu().numpy()
+        for i, (l1, l2, l3, l4, l5) in enumerate(sa_lambdas):
+            print0(f"  sa_lambdas block {i}: {l1:.4f} {l2:.4f} {l3:.4f} {l4:.4f} {l5:.4f}", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
