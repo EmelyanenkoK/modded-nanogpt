@@ -32,32 +32,81 @@ from torch import Tensor, nn
 dynamo.config.recompile_limit = 64
 
 
-def _flatten_params_to_cpu(params: list[Tensor]) -> Tensor:
+def _flatten_params(
+    params: list[Tensor], *, device: torch.device | str | None = None
+) -> Tensor:
     flats = []
     for p in params:
-        flats.append(p.detach().to(device="cpu", dtype=torch.float32).reshape(-1))
+        target_device = device if device is not None else p.device
+        flats.append(p.detach().to(device=target_device, dtype=torch.float32).reshape(-1))
     if flats:
         return torch.cat(flats)
-    return torch.zeros(1, dtype=torch.float32)
+    return torch.zeros(1, dtype=torch.float32, device=device or "cpu")
 
 
-def _flatten_grads_to_cpu(params: list[Tensor]) -> Tensor:
+def _flatten_grads(
+    params: list[Tensor], *, device: torch.device | str | None = None
+) -> Tensor:
     flats = []
     for p in params:
         grad = p.grad
+        target_device = device if device is not None else p.device
         if grad is None:
-            flats.append(torch.zeros(p.numel(), dtype=torch.float32))
+            flats.append(torch.zeros(p.numel(), dtype=torch.float32, device=target_device))
         else:
-            flats.append(grad.detach().to(device="cpu", dtype=torch.float32).reshape(-1))
+            flats.append(grad.detach().to(device=target_device, dtype=torch.float32).reshape(-1))
     if flats:
         return torch.cat(flats)
-    return torch.zeros(1, dtype=torch.float32)
+    return torch.zeros(1, dtype=torch.float32, device=device or "cpu")
 
 
 def _safe_norm(tensor: Tensor) -> float:
     if tensor.numel() == 0:
         return 0.0
     return tensor.norm().item()
+
+
+def _unflatten(
+    info: dict[str, object],
+    key: str,
+    *,
+    dtype: torch.dtype | None = None,
+    device: torch.device | None = None,
+) -> Tensor:
+    tensor = info[key].view(info["shape"])  # type: ignore[index]
+    if dtype is not None or device is not None:
+        tensor = tensor.to(dtype=dtype or tensor.dtype, device=device or tensor.device)
+    return tensor
+
+
+def _load_param_snapshot(
+    diag_cache: list[list[list[dict[str, object]]]],
+    optimizers: list[torch.optim.Optimizer],
+    key: str,
+):
+    for opt_idx, opt in enumerate(optimizers):
+        for group_idx, group in enumerate(opt.param_groups):
+            for param_idx, param in enumerate(group["params"]):
+                info = diag_cache[opt_idx][group_idx][param_idx]
+                if key not in info:
+                    continue
+                snapshot = _unflatten(info, key, dtype=param.dtype, device=param.device)
+                param.copy_(snapshot)
+
+
+def _evaluate_batches(
+    model: nn.Module,
+    batches: list[tuple[Tensor, Tensor, Tensor]],
+    ws: float,
+    ws_final_layer: float,
+) -> float:
+    if not batches:
+        return 0.0
+    total = 0.0
+    for inputs, targets, cum_seqlens in batches:
+        loss = model(inputs, targets, cum_seqlens, ws, ws_final_layer)
+        total += float(loss)
+    return total / len(batches)
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -1183,7 +1232,7 @@ class Hyperparameters:
     # optimization
     num_iterations: int = 1645 # number of iterations to run
     cooldown_frac: int = 0.5 # fraction of training spent cooling down the learning rate
-    lr_tuning_steps: tuple[int, ...] = ()
+    lr_tuning_steps: tuple[int, ...] | None = None
     lr_adapt_clip_min: float = 0.5
     lr_adapt_clip_max: float = 3.0
     # evaluation and logging
@@ -1197,6 +1246,9 @@ class Hyperparameters:
     ws_validate_final_layer: int = 20 # final layer shows no degradation with context length
 
 args = Hyperparameters()
+
+if args.lr_tuning_steps is None:
+    args.lr_tuning_steps = tuple(range(125, args.num_iterations, 125))
 
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
@@ -1289,6 +1341,9 @@ for opt in optimizers:
     for group in opt.param_groups:
         group_names = [param_name_by_id.get(id(p), f"param_{id(p)}") for p in group["params"]]
         opt_names.append(group_names)
+        for param in group["params"]:
+            if not hasattr(param, "lr_mul"):
+                setattr(param, "lr_mul", 1.0)
     optimizer_group_param_names.append(opt_names)
 
 # learning rate schedule: stable then decay
@@ -1398,26 +1453,40 @@ for step in range(train_steps + 1):
         if diagnostic_step:
             diag_batches.append((inputs.clone(), targets.clone(), cum_seqlens.clone()))
         model(inputs, targets, cum_seqlens, ws, ws_final_layer).backward()
-    diag_cache: list[list[dict[str, Tensor]]] | None = None
+    diag_cache: list[list[dict[str, object]]] | None = None
     if diagnostic_step:
         diag_cache = []
         for opt in optimizers:
-            opt_info: list[dict[str, Tensor]] = []
+            opt_info: list[list[dict[str, object]]] = []
             for group in opt.param_groups:
-                params = group["params"]
-                opt_info.append(
-                    {
-                        "pre_grad": _flatten_grads_to_cpu(params),
-                        "param_before": _flatten_params_to_cpu(params),
+                group_cache: list[dict[str, object]] = []
+                for param in group["params"]:
+                    device = param.device
+                    info: dict[str, object] = {
+                        "pre_grad": _flatten_grads([param], device=device),
+                        "param_before": _flatten_params([param], device=device),
+                        "shape": tuple(param.shape),
+                        "lr_mul_before": float(getattr(param, "lr_mul", 1.0)),
+                        "wd_mul_before": float(getattr(param, "wd_mul", 1.0)),
                     }
-                )
+                    if isinstance(opt, Muon):
+                        state = opt.state[param]
+                        momentum_before = state.get("momentum_buffer")
+                        if momentum_before is None:
+                            momentum_before = torch.zeros_like(param, dtype=torch.float32, device=device)
+                        else:
+                            momentum_before = momentum_before.detach().to(dtype=torch.float32).clone()
+                        info["momentum_before"] = momentum_before.reshape(-1)
+                    group_cache.append(info)
+                opt_info.append(group_cache)
             diag_cache.append(opt_info)
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
             baseline_lr = group["initial_lr"] * get_lr(step)
+            group["lr_factor"] = 1.0
             group["lr_baseline"] = baseline_lr
-            group["lr"] = baseline_lr * group.get("lr_factor", 1.0)
+            group["lr"] = baseline_lr
     for group in optimizer2.param_groups:
         frac = min(step / 300, 1) # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
@@ -1427,32 +1496,43 @@ for step in range(train_steps + 1):
     if diagnostic_step and diag_cache is not None:
         for opt_idx, opt in enumerate(optimizers):
             for group_idx, group in enumerate(opt.param_groups):
-                diag_cache[opt_idx][group_idx]["param_after"] = _flatten_params_to_cpu(group["params"])
+                group_cache = diag_cache[opt_idx][group_idx]
+                for param_idx, param in enumerate(group["params"]):
+                    group_cache[param_idx]["param_after"] = _flatten_params([param], device=param.device)
+        with torch.no_grad():
+            _load_param_snapshot(diag_cache, optimizers, "param_before")
+            loss_before = _evaluate_batches(model, diag_batches, ws, ws_final_layer)
+            _load_param_snapshot(diag_cache, optimizers, "param_after")
+            loss_after = _evaluate_batches(model, diag_batches, ws, ws_final_layer)
         model.zero_grad(set_to_none=True)
         for inputs, targets, cum_seqlens in diag_batches:
             model(inputs, targets, cum_seqlens, ws, ws_final_layer).backward()
         metric_entries = []
+        delta_loss_pred_total = 0.0
         for opt_idx, opt in enumerate(optimizers):
             for group_idx, group in enumerate(opt.param_groups):
                 params = group["params"]
-                info = diag_cache[opt_idx][group_idx]
-                info["post_grad"] = _flatten_grads_to_cpu(params)
-                grad_delta = info["post_grad"] - info["pre_grad"]
-                param_delta = info["param_after"] - info["param_before"]
-                grad_delta_norm = _safe_norm(grad_delta)
-                param_delta_norm = _safe_norm(param_delta)
-                metric = grad_delta_norm / max(param_delta_norm, 1e-12)
-                if not math.isfinite(metric):
-                    metric = float("inf")
-                metric_entries.append(
-                    (
-                        opt_idx,
-                        group_idx,
-                        grad_delta_norm,
-                        param_delta_norm,
-                        metric,
+                group_cache = diag_cache[opt_idx][group_idx]
+                for param_idx, param in enumerate(params):
+                    info = group_cache[param_idx]
+                    info["post_grad"] = _flatten_grads([param], device=param.device)
+                    grad_delta = info["post_grad"] - info["pre_grad"]
+                    param_delta = info["param_after"] - info["param_before"]
+                    grad_delta_norm = _safe_norm(grad_delta)
+                    param_delta_norm = _safe_norm(param_delta)
+                    metric = grad_delta_norm / max(param_delta_norm, 1e-12)
+                    if not math.isfinite(metric):
+                        metric = float("inf")
+                    metric_entries.append(
+                        (
+                            opt_idx,
+                            group_idx,
+                            param_idx,
+                            grad_delta_norm,
+                            param_delta_norm,
+                            metric,
+                        )
                     )
-                )
         finite_metrics = [m for *_, m in metric_entries if math.isfinite(m)]
         if finite_metrics:
             pivot = float(torch.tensor(finite_metrics, dtype=torch.float32).median().item())
@@ -1462,7 +1542,8 @@ for step in range(train_steps + 1):
             pivot = 1.0
         clip_min = args.lr_adapt_clip_min
         clip_max = args.lr_adapt_clip_max
-        for opt_idx, group_idx, grad_delta_norm, param_delta_norm, metric in metric_entries:
+        loss_actual = loss_after - loss_before
+        for opt_idx, group_idx, param_idx, grad_delta_norm, param_delta_norm, metric in metric_entries:
             group = optimizers[opt_idx].param_groups[group_idx]
             if metric <= 0 or not math.isfinite(metric):
                 raw_factor = clip_max if metric <= 0 else clip_min
@@ -1471,14 +1552,12 @@ for step in range(train_steps + 1):
             if not math.isfinite(raw_factor):
                 raw_factor = 1.0
             factor = float(min(clip_max, max(clip_min, raw_factor)))
-            group["lr_factor"] = factor
-            group["lr"] = group["lr_baseline"] * factor
+            param = group["params"][param_idx]
+            setattr(param, "lr_mul", factor)
             names = optimizer_group_param_names[opt_idx][group_idx]
-            eff_lrs = [group["lr"] * getattr(param, "lr_mul", 1.0) for param in group["params"]]
-            lr_entries = ", ".join(
-                f"{name}:{lr:.6g}" for name, lr in zip(names, eff_lrs)
-            )
-            info = diag_cache[opt_idx][group_idx]
+            name = names[param_idx] if param_idx < len(names) else f"param_{param_idx}"
+            eff_lr = group["lr"] * getattr(param, "lr_mul", 1.0)
+            info = diag_cache[opt_idx][group_idx][param_idx]
 
             # Compute RMS-based diagnostics and cosine similarity
             eps = 1e-12
@@ -1489,14 +1568,14 @@ for step in range(train_steps + 1):
             dgrad = gpost - gpre
             dtheta = pafter - pbefore
 
-            def _rms_cpu(t: torch.Tensor) -> float:
+            def _rms(t: torch.Tensor) -> float:
                 n = max(1, t.numel())
                 return t.norm().item() / math.sqrt(n)
 
-            rms_dgrad = _rms_cpu(dgrad)
-            rms_dtheta = _rms_cpu(dtheta)
-            rms_gpre = _rms_cpu(gpre)
-            rms_pbefore = _rms_cpu(pbefore)
+            rms_dgrad = _rms(dgrad)
+            rms_dtheta = _rms(dtheta)
+            rms_gpre = _rms(gpre)
+            rms_pbefore = _rms(pbefore)
 
             lhat = rms_dgrad / (rms_dtheta + eps)              # gradient change per unit parameter move
             rho = rms_dgrad / (rms_gpre + eps)                 # relative grad change
@@ -1504,14 +1583,76 @@ for step in range(train_steps + 1):
             denom = gpre.norm().item() * gpost.norm().item()
             cosine = float(torch.dot(gpre, gpost).item() / (denom + eps))
 
+            dtheta_tensor = dtheta
+            gpre_tensor = gpre
+            gpost_tensor = gpost
+            dtheta_norm_sq = max(dtheta_tensor.norm().pow(2).item(), eps)
+            grad_change_proj = float(torch.dot(gpost_tensor - gpre_tensor, dtheta_tensor).item() / dtheta_norm_sq)
+            delta_loss_pred = float(torch.dot(gpre_tensor, dtheta_tensor).item())
+            delta_loss_pred_total += delta_loss_pred
+
+            update_cosine = float("nan")
+            if isinstance(optimizers[opt_idx], Muon) and "momentum_before" in info:
+                param_shape = tuple(info["shape"])  # type: ignore[arg-type]
+                lr_mul_before = float(info["lr_mul_before"])
+                wd_mul_before = float(info["wd_mul_before"])
+                param_before_tensor = pbefore.view(param_shape)
+                grad_post_tensor = gpost.view(param_shape)
+                momentum_before_tensor = info["momentum_before"].view(param_shape)  # type: ignore[union-attr]
+                momentum = group.get("momentum", 0.0)
+                lr_baseline = group.get("lr_baseline", group["lr"])
+                dim_scale = max(1.0, param_shape[-2] / param_shape[-1]) ** 0.5 if len(param_shape) >= 2 else 1.0
+                eff_lr = lr_baseline * dim_scale * lr_mul_before
+                eff_wd = lr_baseline * group.get("weight_decay", 0.0) * wd_mul_before
+
+                def _muon_update_from_grad(grad_tensor: torch.Tensor) -> torch.Tensor:
+                    grad = grad_tensor.view(param_shape)
+                    momentum_before_local = momentum_before_tensor.to(dtype=grad.dtype)
+                    param_before_local = param_before_tensor.to(dtype=grad.dtype)
+                    m_new = momentum_before_local.lerp(grad, 1 - momentum)
+                    update_grad = grad.lerp(m_new, momentum)
+                    if update_grad.ndim < 2:
+                        zeropower_result = update_grad
+                    else:
+                        zeropower_input = update_grad.unsqueeze(0)
+                        if zeropower_input.ndim > 3:
+                            original_shape = zeropower_input.shape
+                            batch = original_shape[0] * original_shape[1]
+                            d1 = original_shape[2]
+                            d2 = original_shape[3]
+                            zeropower_flat = zeropower_input.view(batch, d1, d2)
+                            zeropower_result = newton_schulz_triton(zeropower_flat).view(original_shape)
+                        else:
+                            zeropower_result = newton_schulz_triton(zeropower_input)
+                        zeropower_result = zeropower_result.squeeze(0)
+                    update = (
+                        -eff_wd * param_before_local
+                        - eff_lr * zeropower_result
+                    )
+                    return update.view(-1)
+
+                update_pre = dtheta_tensor
+                update_post = _muon_update_from_grad(grad_post_tensor)
+                denom_updates = update_pre.norm().item() * update_post.norm().item()
+                if denom_updates > 0:
+                    update_cosine = float(torch.dot(update_pre, update_post).item() / denom_updates)
+
             log_msg = (
-                f"lr_tune step:{step} opt:{opt_idx} group:{group_idx} metric:{metric:.6g} "
+                f"lr_tune step:{step} opt:{opt_idx} group:{group_idx} param:{param_idx} name:{name} metric:{metric:.6g} "
                 f"grad_pre:{_safe_norm(info['pre_grad']):.6g} grad_post:{_safe_norm(info['post_grad']):.6g} "
                 f"grad_delta:{grad_delta_norm:.6g} param_delta:{param_delta_norm:.6g} "
-                f"factor:{factor:.6g} baseline_lr:{group['lr_baseline']:.6g} lrs:[{lr_entries}] "
-                f"lhat:{lhat:.6g} rho:{rho:.6g} utr:{utr:.6g} cos:{cosine:.6g}"
+                f"factor:{factor:.6g} baseline_lr:{group['lr_baseline']:.6g} eff_lr:{eff_lr:.6g} "
+                f"lhat:{lhat:.6g} rho:{rho:.6g} utr:{utr:.6g} cos:{cosine:.6g} "
+                f"ucos:{update_cosine:.6g} gproj:{grad_change_proj:.6g} dlpred:{delta_loss_pred:.6g}"
             )
             print0(log_msg)
+        loss_ratio = float("nan")
+        if abs(delta_loss_pred_total) > 1e-12:
+            loss_ratio = loss_actual / delta_loss_pred_total
+        print0(
+            f"lr_tune step:{step} loss_pred_total:{delta_loss_pred_total:.6g} "
+            f"loss_actual:{loss_actual:.6g} loss_ratio:{loss_ratio:.6g}"
+        )
         model.zero_grad(set_to_none=True)
         del diag_cache, diag_batches
     else:
