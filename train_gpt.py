@@ -1411,6 +1411,8 @@ for step in range(train_steps + 1):
             diag_batches.append((inputs.clone(), targets.clone(), cum_seqlens.clone()))
         model(inputs, targets, cum_seqlens, ws, ws_final_layer).backward()
     diag_cache: list[list[dict[str, Tensor]]] | None = None
+    diag_loss_before: float | None = None
+    diag_loss_after: float | None = None
     if diagnostic_step:
         diag_cache = []
         for opt in optimizers:
@@ -1427,6 +1429,11 @@ for step in range(train_steps + 1):
                     )
                 opt_info.append(group_cache)
             diag_cache.append(opt_info)
+        diag_loss_before = 0.0
+        with torch.no_grad():
+            for inputs, targets, cum_seqlens in diag_batches:
+                loss = model(inputs, targets, cum_seqlens, ws, ws_final_layer)
+                diag_loss_before += float(loss.item())
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
@@ -1440,6 +1447,12 @@ for step in range(train_steps + 1):
     # step the optimizers
     for opt in optimizers:
         opt.step()
+    if diagnostic_step:
+        diag_loss_after = 0.0
+        with torch.no_grad():
+            for inputs, targets, cum_seqlens in diag_batches:
+                loss = model(inputs, targets, cum_seqlens, ws, ws_final_layer)
+                diag_loss_after += float(loss.item())
     if diagnostic_step and diag_cache is not None:
         for opt_idx, opt in enumerate(optimizers):
             for group_idx, group in enumerate(opt.param_groups):
@@ -1450,6 +1463,8 @@ for step in range(train_steps + 1):
         for inputs, targets, cum_seqlens in diag_batches:
             model(inputs, targets, cum_seqlens, ws, ws_final_layer).backward()
         metric_entries = []
+        delta_loss_pred_total = 0.0
+        eps = 1e-12
         for opt_idx, opt in enumerate(optimizers):
             for group_idx, group in enumerate(opt.param_groups):
                 params = group["params"]
@@ -1500,13 +1515,23 @@ for step in range(train_steps + 1):
             info = diag_cache[opt_idx][group_idx][param_idx]
 
             # Compute RMS-based diagnostics and cosine similarity
-            eps = 1e-12
             gpre = info["pre_grad"]
             gpost = info["post_grad"]
             pbefore = info["param_before"]
             pafter = info["param_after"]
             dgrad = gpost - gpre
             dtheta = pafter - pbefore
+            update_norm = dtheta.norm().item()
+            grad_norm = gpre.norm().item()
+            update_norm_sq = max(update_norm ** 2, eps)
+            delta_loss_pred = float(torch.dot(gpre, dtheta).item())
+            delta_loss_pred_total += delta_loss_pred
+            grad_change_dot_update = float(torch.dot(dgrad, dtheta).item())
+            grad_change_ratio = grad_change_dot_update / update_norm_sq
+            if update_norm > eps and grad_norm > eps:
+                cosine_update = float(torch.dot(-dtheta, gpre).item() / (update_norm * grad_norm))
+            else:
+                cosine_update = 0.0
 
             def _rms(t: torch.Tensor) -> float:
                 n = max(1, t.numel())
@@ -1528,9 +1553,17 @@ for step in range(train_steps + 1):
                 f"grad_pre:{_safe_norm(info['pre_grad']):.6g} grad_post:{_safe_norm(info['post_grad']):.6g} "
                 f"grad_delta:{grad_delta_norm:.6g} param_delta:{param_delta_norm:.6g} "
                 f"factor:{factor:.6g} baseline_lr:{group['lr_baseline']:.6g} eff_lr:{eff_lr:.6g} "
-                f"lhat:{lhat:.6g} rho:{rho:.6g} utr:{utr:.6g} cos:{cosine:.6g}"
+                f"lhat:{lhat:.6g} rho:{rho:.6g} utr:{utr:.6g} cos:{cosine:.6g} "
+                f"cos_upd:{cosine_update:.6g} gdiff_ratio:{grad_change_ratio:.6g} dl_pred:{delta_loss_pred:.6g}"
             )
             print0(log_msg)
+        if diag_loss_before is not None and diag_loss_after is not None:
+            delta_loss_actual = diag_loss_after - diag_loss_before
+            loss_ratio = delta_loss_actual / (delta_loss_pred_total + eps)
+            print0(
+                f"lr_tune step:{step} loss_before:{diag_loss_before:.6g} loss_after:{diag_loss_after:.6g} "
+                f"loss_pred:{delta_loss_pred_total:.6g} loss_actual:{delta_loss_actual:.6g} loss_ratio:{loss_ratio:.6g}"
+            )
         model.zero_grad(set_to_none=True)
         del diag_cache, diag_batches
     else:
