@@ -31,6 +31,40 @@ from torch import Tensor, nn
 
 dynamo.config.recompile_limit = 64
 
+
+def _flatten_params(
+    params: list[Tensor], *, device: torch.device | str | None = None
+) -> Tensor:
+    flats = []
+    for p in params:
+        target_device = device if device is not None else p.device
+        flats.append(p.detach().to(device=target_device, dtype=torch.float32).reshape(-1))
+    if flats:
+        return torch.cat(flats)
+    return torch.zeros(1, dtype=torch.float32, device=device or "cpu")
+
+
+def _flatten_grads(
+    params: list[Tensor], *, device: torch.device | str | None = None
+) -> Tensor:
+    flats = []
+    for p in params:
+        grad = p.grad
+        target_device = device if device is not None else p.device
+        if grad is None:
+            flats.append(torch.zeros(p.numel(), dtype=torch.float32, device=target_device))
+        else:
+            flats.append(grad.detach().to(device=target_device, dtype=torch.float32).reshape(-1))
+    if flats:
+        return torch.cat(flats)
+    return torch.zeros(1, dtype=torch.float32, device=device or "cpu")
+
+
+def _safe_norm(tensor: Tensor) -> float:
+    if tensor.numel() == 0:
+        return 0.0
+    return tensor.norm().item()
+
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
@@ -1155,6 +1189,9 @@ class Hyperparameters:
     # optimization
     num_iterations: int = 1645 # number of iterations to run
     cooldown_frac: int = 0.5 # fraction of training spent cooling down the learning rate
+    lr_tuning_steps: tuple[int, ...] | None = None
+    lr_adapt_clip_min: float = 0.5
+    lr_adapt_clip_max: float = 3.0
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -1167,9 +1204,13 @@ class Hyperparameters:
 
 args = Hyperparameters()
 
+if args.lr_tuning_steps is None:
+    args.lr_tuning_steps = tuple(range(125, args.num_iterations, 125))
+
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
 args.val_files = os.path.join(data_path, args.val_files)
+lr_tuning_steps_set = set(args.lr_tuning_steps)
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
@@ -1247,6 +1288,20 @@ optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
+        group["lr_factor"] = 1.0
+        group["lr_baseline"] = group["lr"]
+
+param_name_by_id = {id(p): name for name, p in model.named_parameters()}
+optimizer_group_param_names: list[list[list[str]]] = []
+for opt in optimizers:
+    opt_names: list[list[str]] = []
+    for group in opt.param_groups:
+        group_names = [param_name_by_id.get(id(p), f"param_{id(p)}") for p in group["params"]]
+        opt_names.append(group_names)
+        for param in group["params"]:
+            if not hasattr(param, "lr_mul"):
+                setattr(param, "lr_mul", 1.0)
+    optimizer_group_param_names.append(opt_names)
 
 # learning rate schedule: stable then decay
 def get_lr(step: int):
@@ -1348,21 +1403,171 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+    diagnostic_step = step in lr_tuning_steps_set
+    diag_batches: list[tuple[Tensor, Tensor, Tensor]] = []
     for _ in range(grad_accum_steps):
         inputs, targets, cum_seqlens = next(train_loader)
+        if diagnostic_step:
+            diag_batches.append((inputs.clone(), targets.clone(), cum_seqlens.clone()))
         model(inputs, targets, cum_seqlens, ws, ws_final_layer).backward()
+    diag_cache: list[list[dict[str, Tensor]]] | None = None
+    diag_loss_before: float | None = None
+    diag_loss_after: float | None = None
+    if diagnostic_step:
+        diag_cache = []
+        for opt in optimizers:
+            opt_info: list[list[dict[str, Tensor]]] = []
+            for group in opt.param_groups:
+                group_cache: list[dict[str, Tensor]] = []
+                for param in group["params"]:
+                    device = param.device
+                    group_cache.append(
+                        {
+                            "pre_grad": _flatten_grads([param], device=device),
+                            "param_before": _flatten_params([param], device=device),
+                        }
+                    )
+                opt_info.append(group_cache)
+            diag_cache.append(opt_info)
+        diag_loss_before = 0.0
+        with torch.no_grad():
+            for inputs, targets, cum_seqlens in diag_batches:
+                loss = model(inputs, targets, cum_seqlens, ws, ws_final_layer)
+                diag_loss_before += float(loss.item())
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
+            baseline_lr = group["initial_lr"] * get_lr(step)
+            group["lr_factor"] = 1.0
+            group["lr_baseline"] = baseline_lr
+            group["lr"] = baseline_lr
     for group in optimizer2.param_groups:
         frac = min(step / 300, 1) # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers
     for opt in optimizers:
         opt.step()
-    # null the gradients
-    model.zero_grad(set_to_none=True)
+    if diagnostic_step:
+        diag_loss_after = 0.0
+        with torch.no_grad():
+            for inputs, targets, cum_seqlens in diag_batches:
+                loss = model(inputs, targets, cum_seqlens, ws, ws_final_layer)
+                diag_loss_after += float(loss.item())
+    if diagnostic_step and diag_cache is not None:
+        for opt_idx, opt in enumerate(optimizers):
+            for group_idx, group in enumerate(opt.param_groups):
+                group_cache = diag_cache[opt_idx][group_idx]
+                for param_idx, param in enumerate(group["params"]):
+                    group_cache[param_idx]["param_after"] = _flatten_params([param], device=param.device)
+        model.zero_grad(set_to_none=True)
+        for inputs, targets, cum_seqlens in diag_batches:
+            model(inputs, targets, cum_seqlens, ws, ws_final_layer).backward()
+        metric_entries = []
+        delta_loss_pred_total = 0.0
+        eps = 1e-12
+        for opt_idx, opt in enumerate(optimizers):
+            for group_idx, group in enumerate(opt.param_groups):
+                params = group["params"]
+                group_cache = diag_cache[opt_idx][group_idx]
+                for param_idx, param in enumerate(params):
+                    info = group_cache[param_idx]
+                    info["post_grad"] = _flatten_grads([param], device=param.device)
+                    grad_delta = info["post_grad"] - info["pre_grad"]
+                    param_delta = info["param_after"] - info["param_before"]
+                    grad_delta_norm = _safe_norm(grad_delta)
+                    param_delta_norm = _safe_norm(param_delta)
+                    metric = grad_delta_norm / max(param_delta_norm, 1e-12)
+                    if not math.isfinite(metric):
+                        metric = float("inf")
+                    metric_entries.append(
+                        (
+                            opt_idx,
+                            group_idx,
+                            param_idx,
+                            grad_delta_norm,
+                            param_delta_norm,
+                            metric,
+                        )
+                    )
+        finite_metrics = [m for *_, m in metric_entries if math.isfinite(m)]
+        if finite_metrics:
+            pivot = float(torch.tensor(finite_metrics, dtype=torch.float32).median().item())
+            if not math.isfinite(pivot) or pivot <= 0:
+                pivot = 1.0
+        else:
+            pivot = 1.0
+        clip_min = args.lr_adapt_clip_min
+        clip_max = args.lr_adapt_clip_max
+        for opt_idx, group_idx, param_idx, grad_delta_norm, param_delta_norm, metric in metric_entries:
+            group = optimizers[opt_idx].param_groups[group_idx]
+            if metric <= 0 or not math.isfinite(metric):
+                raw_factor = clip_max if metric <= 0 else clip_min
+            else:
+                raw_factor = pivot / metric
+            if not math.isfinite(raw_factor):
+                raw_factor = 1.0
+            factor = float(min(clip_max, max(clip_min, raw_factor)))
+            param = group["params"][param_idx]
+            setattr(param, "lr_mul", factor)
+            names = optimizer_group_param_names[opt_idx][group_idx]
+            name = names[param_idx] if param_idx < len(names) else f"param_{param_idx}"
+            eff_lr = group["lr"] * getattr(param, "lr_mul", 1.0)
+            info = diag_cache[opt_idx][group_idx][param_idx]
+
+            # Compute RMS-based diagnostics and cosine similarity
+            gpre = info["pre_grad"]
+            gpost = info["post_grad"]
+            pbefore = info["param_before"]
+            pafter = info["param_after"]
+            dgrad = gpost - gpre
+            dtheta = pafter - pbefore
+            update_norm = dtheta.norm().item()
+            grad_norm = gpre.norm().item()
+            update_norm_sq = max(update_norm ** 2, eps)
+            delta_loss_pred = float(torch.dot(gpre, dtheta).item())
+            delta_loss_pred_total += delta_loss_pred
+            grad_change_dot_update = float(torch.dot(dgrad, dtheta).item())
+            grad_change_ratio = grad_change_dot_update / update_norm_sq
+            if update_norm > eps and grad_norm > eps:
+                cosine_update = float(torch.dot(-dtheta, gpre).item() / (update_norm * grad_norm))
+            else:
+                cosine_update = 0.0
+
+            def _rms(t: torch.Tensor) -> float:
+                n = max(1, t.numel())
+                return t.norm().item() / math.sqrt(n)
+
+            rms_dgrad = _rms(dgrad)
+            rms_dtheta = _rms(dtheta)
+            rms_gpre = _rms(gpre)
+            rms_pbefore = _rms(pbefore)
+
+            lhat = rms_dgrad / (rms_dtheta + eps)              # gradient change per unit parameter move
+            rho = rms_dgrad / (rms_gpre + eps)                 # relative grad change
+            utr = rms_dtheta / (rms_pbefore + eps)             # update-to-weight ratio
+            denom = gpre.norm().item() * gpost.norm().item()
+            cosine = float(torch.dot(gpre, gpost).item() / (denom + eps))
+
+            log_msg = (
+                f"lr_tune step:{step} opt:{opt_idx} group:{group_idx} param:{param_idx} name:{name} metric:{metric:.6g} "
+                f"grad_pre:{_safe_norm(info['pre_grad']):.6g} grad_post:{_safe_norm(info['post_grad']):.6g} "
+                f"grad_delta:{grad_delta_norm:.6g} param_delta:{param_delta_norm:.6g} "
+                f"factor:{factor:.6g} baseline_lr:{group['lr_baseline']:.6g} eff_lr:{eff_lr:.6g} "
+                f"lhat:{lhat:.6g} rho:{rho:.6g} utr:{utr:.6g} cos:{cosine:.6g} "
+                f"cos_upd:{cosine_update:.6g} gdiff_ratio:{grad_change_ratio:.6g} dl_pred:{delta_loss_pred:.6g}"
+            )
+            print0(log_msg)
+        if diag_loss_before is not None and diag_loss_after is not None:
+            delta_loss_actual = diag_loss_after - diag_loss_before
+            loss_ratio = delta_loss_actual / (delta_loss_pred_total + eps)
+            print0(
+                f"lr_tune step:{step} loss_before:{diag_loss_before:.6g} loss_after:{diag_loss_after:.6g} "
+                f"loss_pred:{delta_loss_pred_total:.6g} loss_actual:{delta_loss_actual:.6g} loss_ratio:{loss_ratio:.6g}"
+            )
+        model.zero_grad(set_to_none=True)
+        del diag_cache, diag_batches
+    else:
+        model.zero_grad(set_to_none=True)
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
