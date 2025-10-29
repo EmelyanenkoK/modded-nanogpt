@@ -31,6 +31,15 @@ from torch import Tensor, nn
 
 dynamo.config.recompile_limit = 64
 
+HALF_ROPE_CUT = True
+if HALF_ROPE_CUT:
+  HALF_ROPE_CONSTANT = 0
+else:
+  ROPE_QUADRATIC=True
+  ROPE_QUARTIC=False
+  ROPE_MIX=False
+
+
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
@@ -792,9 +801,23 @@ class Yarn(nn.Module):
         self.reset()
         
     def reset(self):
-        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=self.head_dim//4, dtype=torch.float32, device=device)
-        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
-        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(self.head_dim//4)])
+        if HALF_ROPE_CUT:
+            angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=self.head_dim//4, dtype=torch.float32, device=device)
+            # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
+            # lets fill the rest of angular_freq with HALF_ROPE_CONSTANT
+            angular_freq = torch.cat([angular_freq, torch.full((self.head_dim//4,), HALF_ROPE_CONSTANT, dtype=torch.float32, device=device)], dim=0)
+        else:
+            if ROPE_QUADRATIC:
+                freq_power = torch.linspace(0, 1, steps=self.head_dim//2, dtype=torch.float32, device=device) ** 2
+            elif ROPE_QUARTIC:
+                freq_power = torch.linspace(0, 1, steps=self.head_dim//2, dtype=torch.float32, device=device) ** 4
+            elif ROPE_MIX:
+                #x^2+x^4*(1-x^2)
+                lin_space = torch.linspace(0, 1, steps=self.head_dim//2, dtype=torch.float32, device=device)
+                freq_power = lin_space**2 + lin_space**4 * (1 - lin_space**2)
+            else:
+              freq_power = torch.linspace(0, 1, steps=self.head_dim//2, dtype=torch.float32, device=device)
+            angular_freq = (1 / 10000) ** freq_power
         t = torch.arange(self.max_seq_len, dtype=torch.float32, device=device)
         theta = torch.outer(t, angular_freq)
         self.cos = nn.Buffer(
@@ -814,8 +837,8 @@ class Yarn(nn.Module):
         self.angular_freq *= scaling_factor + interpolation_weight * (1 - scaling_factor)
         t = torch.arange(self.max_seq_len, dtype=torch.float32, device=self.angular_freq.device)
         theta = torch.outer(t, self.angular_freq)
-        self.cos.copy_(theta.cos())
-        self.sin.copy_(theta.sin())
+        self.cos.copy_(theta.cos().to(self.cos.dtype))
+        self.sin.copy_(theta.sin().to(self.cos.dtype))
         self.attn_scale *= 0.2 * math.log(new_window / old_window) + 1
 
 def rotary(x_BTHD: Tensor, cos: Tensor, sin: Tensor):
